@@ -41,7 +41,15 @@ All settings are in `config.json`:
   "runs_dir": "runs",
   "gnomad_dir": "gnomad_variants",
   "conda_env": "bio",
-  "keep_intermediate_files": false
+  "keep_intermediate_files": false,
+  "bam_filtering": {
+    "enabled": true,
+    "min_mapped_pct_of_generated": 10,
+    "max_pct_filtered": 50,
+    "min_kept_pct_of_reference": 10,
+    "read_len": 75,
+    "step": 35
+  }
 }
 ```
 
@@ -49,6 +57,12 @@ All settings are in `config.json`:
 - `data_dir`, `runs_dir`, `gnomad_dir` — relative to repo root, or absolute paths
 - `conda_env` — name of the conda environment (default: `bio`)
 - `keep_intermediate_files` — keep all per-gene intermediates when `true`; default `false` keeps only `gene_snps_annotated.vcf` in each gene output folder
+- `bam_filtering` — LIS-based read-order filtering before variant calling
+  - `enabled` — enable/disable filtering
+  - `min_mapped_pct_of_generated`, `max_pct_filtered`, `min_kept_pct_of_reference` — required when enabled, each in `[0,100]`
+  - `read_len`, `step` — pseudo-read generation parameters for denominator calculations (default `75` and `35`)
+
+If `bam_filtering.enabled=true` and `min_mapped_pct_of_generated` is set, missing generated pseudo-read counts for any homologue cause a fail-fast error for that gene.
 
 One-time cluster setup: `./setup_cluster.sh` (creates dirs, downloads ClinVar)
 
@@ -95,6 +109,9 @@ micromamba run -n bio bcftools annotate -a clinvar.vcf.gz -c INFO/CLNSIG,INFO/CL
       - `genes_from_coordinates.fastq` - Homolog sequences
       - `pseudo_reads.fastq` - Generated pseudoreads
       - `aln.sorted.bam` - Aligned reads
+      - `aln.filtered.lis.bam` - Filtered reads (when BAM filtering enabled and intermediates kept)
+      - `bam_filtering_stats.json` - Per-homologue BAM filtering stats (when intermediates kept)
+      - `bam_filtering_overall.json` - BAM filtering summary (when intermediates kept)
       - `gene_snps.vcf` - Called variants (local coordinates)
       - `gene_snps_normalized.vcf.gz` - Normalized variants (genomic coordinates)
       - `gene_snps_annotated.vcf` - Variants annotated with ClinVar and gnomAD
@@ -126,9 +143,10 @@ micromamba run -n bio bcftools annotate -a clinvar.vcf.gz -c INFO/CLNSIG,INFO/CL
 3. **Orthologs → Genomic Sequences → FASTQ**: Fetch homolog gene sequences from NCBI
 4. **FASTQ → Pseudoreads**: Slice sequences into overlapping reads (75bp, step 35)
 5. **Pseudoreads → Alignment → BAM**: Align homolog reads to human reference with BWA
-6. **BAM → Variants → VCF**: Call SNPs/indels with VarScan
-7. **VCF → Normalized VCF**: Convert local coordinates to genomic coordinates
-8. **Normalized VCF + ClinVar + gnomAD → Annotated VCF**: Single-pass annotation with both databases
+6. **BAM → Filtered BAM**: Filter by dominant strand + LIS backbone + homologue-level thresholds
+7. **Filtered BAM → Variants → VCF**: Call SNPs/indels with VarScan
+8. **VCF → Normalized VCF**: Convert local coordinates to genomic coordinates
+9. **Normalized VCF + ClinVar + gnomAD → Annotated VCF**: Single-pass annotation with both databases
 
 ### Key Functions (in pipeline/run_gene.py)
 
@@ -138,7 +156,8 @@ All functions take an explicit `work_dir: Path` parameter — no `os.chdir()`.
 - `download_gene_seq(gene_id, work_dir)` - Fetch genomic sequence, returns coordinates dict
 - `generate_pseudoreads(input_fastq, work_dir)` - Create sliding window reads from sequences (75bp, step 35)
 - `align_pseudoreads(work_dir)` - Run BWA alignment pipeline (index, align, sort, index BAM)
-- `call_variants(work_dir)` - Run VarScan variant calling (SNPs and indels)
+- `filter_bam_for_gene(work_dir, filtering_cfg, verbose=False)` - Production LIS BAM filtering
+- `call_variants(work_dir, bam_path)` - Run VarScan variant calling (SNPs and indels)
 - `normalize_vcf(gene_coords, work_dir)` - Convert local VCF coordinates to genomic coordinates
 - `annotate_variants(work_dir, gnomad_vcf_gz)` - Annotate variants with ClinVar and gnomAD in a single pass
 - `run_gene(gene_id, work_dir, cfg)` - Execute full pipeline for one gene

@@ -1,0 +1,89 @@
+# Bioinf Variant Pipeline
+
+Pipeline for gene-level variant discovery from ortholog-derived pseudo-reads, with ClinVar and gnomAD annotation.
+
+## What it does
+
+1. Downloads reference gene sequence (NCBI).
+2. Fetches ortholog sequences (NCBI Datasets, fallback to BLAST).
+3. Generates pseudo-reads from ortholog sequences.
+4. Aligns pseudo-reads to reference gene (BWA + samtools).
+5. Filters BAM by homologue read-order consistency (LIS-based filtering).
+6. Calls variants (VarScan).
+7. Normalizes VCF coordinates to genomic coordinates.
+8. Annotates variants with ClinVar and optionally gnomAD.
+
+## Requirements
+
+- micromamba/mamba/conda
+- environment from `environment.yml`
+- `config.json` in repo root
+
+## Setup
+
+```bash
+micromamba create -f environment.yml
+```
+
+## Run
+
+```bash
+bash run.sh config.json
+```
+
+## Configuration (`config.json`)
+
+Example:
+
+```json
+{
+  "gene_ids": [672],
+  "hitlist_size": 5000,
+  "env_file": ".env",
+  "data_dir": "data",
+  "runs_dir": "runs",
+  "gnomad_dir": "gnomad_variants",
+  "conda_env": "bio",
+  "keep_intermediate_files": false,
+  "bam_filtering": {
+    "enabled": true,
+    "min_mapped_pct_of_generated": 10,
+    "max_pct_filtered": 50,
+    "min_kept_pct_of_reference": 10,
+    "read_len": 75,
+    "step": 35
+  }
+}
+```
+
+### `bam_filtering` rules
+
+- `enabled`: boolean.
+- If `enabled=true`, these are required and must be in `[0, 100]`:
+  - `min_mapped_pct_of_generated`
+  - `max_pct_filtered`
+  - `min_kept_pct_of_reference`
+- `read_len` and `step` are optional positive integers (default `75` and `35`).
+- If `min_mapped_pct_of_generated` is enabled and generated pseudo-read counts cannot be computed for homologues, gene processing fails fast.
+
+## Outputs
+
+Run folder:
+
+- `runs/run_YYYYMMDD_HHMMSS/pipeline.log`
+- `runs/run_YYYYMMDD_HHMMSS/run_params.json`
+- `runs/run_YYYYMMDD_HHMMSS/gene_<ID>/gene_snps_annotated.vcf` (final output)
+
+If `keep_intermediate_files=true`, gene directory also keeps intermediates such as:
+
+- `aln.sorted.bam`
+- `aln.filtered.lis.bam`
+- `bam_filtering_stats.json`
+- `bam_filtering_overall.json`
+- other intermediate FASTQ/VCF/BAM files
+
+## Notes
+
+- Entrez credentials are loaded from `env_file` (`ENTREZ_EMAIL`, `ENTREZ_API_KEY`).
+- gnomAD files are cached in `gnomad_variants/`.
+- Test/sandbox plotting tools stay under `tests/` and are not part of production pipeline execution.

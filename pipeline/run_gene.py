@@ -12,6 +12,7 @@ from Bio import Entrez, SeqIO
 from loguru import logger
 
 import config
+from bam_filtering import filter_bam_for_gene
 from gnomad import download_gnomad_for_gene, prepare_gnomad_vcf
 from orthologs import get_source
 
@@ -106,15 +107,18 @@ def align_pseudoreads(work_dir):
     logger.success(f"Alignment complete -> {sorted_bam}")
 
 
-def call_variants(work_dir):
+def call_variants(work_dir, bam_path: Path):
     """Run VarScan variant calling."""
     logger.info("Calling variants with VarScan")
 
     ref = work_dir / "gene_seq.fasta"
-    sorted_bam = work_dir / "aln.sorted.bam"
+    sorted_bam = Path(bam_path)
     pileup = work_dir / "gene.mpileup"
     snps = work_dir / "gene_snps.vcf"
     indels = work_dir / "gene_indels.vcf"
+
+    if not sorted_bam.exists():
+        raise FileNotFoundError(f"BAM for variant calling not found: {sorted_bam}")
 
     config.run_bio(f"samtools faidx {ref}")
     config.run_bio(f"samtools mpileup -f {ref} {sorted_bam} > {pileup}")
@@ -289,7 +293,8 @@ def run_gene(gene_id, work_dir, cfg):
     Args:
         gene_id: NCBI Gene ID
         work_dir: Directory for this gene's outputs
-        cfg: Config dict with keys like 'hitlist_size' and optional 'keep_intermediate_files'
+        cfg: Config dict with keys like 'hitlist_size', 'bam_filtering'
+             and optional 'keep_intermediate_files'
     """
     work_dir = Path(work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
@@ -313,14 +318,29 @@ def run_gene(gene_id, work_dir, cfg):
     # Step 4: Align pseudoreads
     align_pseudoreads(work_dir)
 
-    # Step 5: Call variants
-    call_variants(work_dir)
+    # Step 5: Optional LIS BAM filtering (enabled by default via config)
+    bam_for_variants = work_dir / "aln.sorted.bam"
+    bam_filtering_cfg = cfg.get("bam_filtering", {"enabled": False})
+    if bam_filtering_cfg.get("enabled", True):
+        logger.info("Running LIS BAM filtering before variant calling")
+        filter_result = filter_bam_for_gene(
+            work_dir=work_dir,
+            filtering_cfg=bam_filtering_cfg,
+            verbose=False,
+        )
+        bam_for_variants = filter_result.output_bam
+        logger.info(f"Using filtered BAM for variant calling: {bam_for_variants}")
+    else:
+        logger.info("BAM filtering disabled by config; using aln.sorted.bam")
 
-    # Step 6: Normalize VCF
+    # Step 6: Call variants
+    call_variants(work_dir, bam_for_variants)
+
+    # Step 7: Normalize VCF
     if gene_coords:
         normalize_vcf(gene_coords, work_dir)
 
-    # Step 7: Annotate variants with ClinVar and gnomAD
+    # Step 8: Annotate variants with ClinVar and gnomAD
     gnomad_vcf_full, _ = download_gnomad_for_gene(gene_id)
     gnomad_gz = prepare_gnomad_vcf(gnomad_vcf_full, work_dir) if gnomad_vcf_full else None
     annotate_variants(work_dir, gnomad_gz)
