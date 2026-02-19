@@ -4,7 +4,7 @@ gnomAD integration module for the bioinformatics pipeline.
 Provides:
 - NCBI Gene ID to Ensembl ID conversion
 - gnomAD variant download via GraphQL API
-- VCF preparation for bcftools intersection
+- VCF preparation for bcftools annotation/intersection
 """
 
 import asyncio
@@ -18,8 +18,6 @@ from loguru import logger
 import config
 
 GNOMAD_API_URL = "https://gnomad.broadinstitute.org/api"
-
-MAF_THRESHOLD = 0.001 / 100  # 0.01%
 
 GNOMAD_QUERY = gql("""
 query VariantsInGene($gene_id: String!) {
@@ -152,21 +150,17 @@ def _write_vcf(variants: list, out_path: Path) -> None:
 async def fetch_gnomad_variants(
     ensembl_id: str,
     output_path_full: Path,
-    output_path_filtered: Path,
-    maf_threshold: float = MAF_THRESHOLD
-) -> tuple[int, int]:
+ ) -> int:
     """
     Download gnomAD variants for a gene via GraphQL API.
-    Writes two VCF files: one with all variants, one with AF-filtered variants.
+    Writes one VCF file with all variants.
 
     Args:
         ensembl_id: Ensembl Gene ID (e.g., "ENSG00000012048")
         output_path_full: Path for full VCF file (all variants)
-        output_path_filtered: Path for filtered VCF file (AF >= threshold)
-        maf_threshold: Minimum MAF to include in filtered VCF (default 0.01%)
 
     Returns:
-        Tuple of (full_count, filtered_count)
+        Number of downloaded variants
     """
     logger.info(f"Fetching gnomAD variants for {ensembl_id}")
 
@@ -182,84 +176,74 @@ async def fetch_gnomad_variants(
         gene = data.get("gene")
         if not gene:
             logger.warning(f"No gene data returned for {ensembl_id}")
-            return 0, 0
+            return 0
 
         # Collect all variants
         all_variants = gene.get("variants", [])
 
-        # Filter variants by AF threshold
-        filtered_variants = []
-        for v in all_variants:
-            af = _select_af(v)
-            if af is not None and af >= maf_threshold:
-                filtered_variants.append(v)
-
-        # Write both VCF files
+        # Write full VCF only. Filtering is done downstream in analysis.
         _write_vcf(all_variants, output_path_full)
-        _write_vcf(filtered_variants, output_path_filtered)
 
         logger.success(f"Saved gnomAD variants -> {output_path_full} ({len(all_variants)} total)")
-        logger.success(f"Saved gnomAD variants -> {output_path_filtered} ({len(filtered_variants)} AF >= {maf_threshold})")
 
-        return len(all_variants), len(filtered_variants)
+        return len(all_variants)
 
     except TransportQueryError as e:
         logger.warning(f"gnomAD query failed for {ensembl_id}: {e}")
-        return 0, 0
+        return 0
 
     finally:
         await transport.close()
 
 
-def download_gnomad_for_gene(ncbi_gene_id: int) -> tuple[Path | None, Path | None]:
+def download_gnomad_for_gene(ncbi_gene_id: int) -> Path | None:
     """
     Download gnomAD variants for a gene (sync wrapper).
-    Uses cache if available. Downloads two versions: full and AF-filtered.
+    Uses cache if available.
 
     Args:
         ncbi_gene_id: NCBI Gene ID
 
     Returns:
-        Tuple of (full_vcf_path, filtered_vcf_path), or (None, None) if download failed
+        Full gnomAD VCF path, or None if download failed
     """
     ensembl_id = ncbi_to_ensembl(ncbi_gene_id)
     if not ensembl_id:
         logger.warning(f"Cannot download gnomAD: no Ensembl ID for gene {ncbi_gene_id}")
-        return None, None
+        return None
 
     config.GNOMAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
     output_vcf_full = config.GNOMAD_CACHE_DIR / f"{ensembl_id}_full.vcf"
-    output_vcf_filtered = config.GNOMAD_CACHE_DIR / f"{ensembl_id}_filtered.vcf"
 
-    # Check cache for both files
-    if output_vcf_full.exists() and output_vcf_filtered.exists():
-        logger.info(f"Using cached gnomAD data: {output_vcf_full} and {output_vcf_filtered}")
-        return output_vcf_full, output_vcf_filtered
+    # Check cache
+    if output_vcf_full.exists():
+        logger.info(f"Using cached gnomAD data: {output_vcf_full}")
+        return output_vcf_full
 
-    # Download variants - handle both notebook (running loop) and script contexts
+    # Download variants - handle both notebook (running loop) and script contexts.
     try:
         # Check if we're in a running event loop (e.g., Jupyter)
-        loop = asyncio.get_running_loop()
+        _ = asyncio.get_running_loop()
         # We're in a running loop - use nest_asyncio or run in new thread
         import concurrent.futures
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future = executor.submit(
                 asyncio.run,
-                fetch_gnomad_variants(ensembl_id, output_vcf_full, output_vcf_filtered)
+                fetch_gnomad_variants(ensembl_id, output_vcf_full)
             )
-            full_count, filtered_count = future.result()
+            full_count = future.result()
     except RuntimeError:
         # No running loop - safe to use asyncio.run()
-        full_count, filtered_count = asyncio.run(
-            fetch_gnomad_variants(ensembl_id, output_vcf_full, output_vcf_filtered)
+        full_count = asyncio.run(
+            fetch_gnomad_variants(ensembl_id, output_vcf_full)
         )
 
     if full_count == 0:
         logger.warning(f"No gnomAD variants found for {ensembl_id}")
-        return None, None
+        return None
 
-    return output_vcf_full, output_vcf_filtered
+    return output_vcf_full
 
 
 def prepare_gnomad_vcf(vcf_path: Path, output_dir: Path, suffix: str = "") -> Path | None:
@@ -273,7 +257,7 @@ def prepare_gnomad_vcf(vcf_path: Path, output_dir: Path, suffix: str = "") -> Pa
     Args:
         vcf_path: Path to source gnomAD VCF
         output_dir: Directory to write prepared VCF
-        suffix: Optional suffix for output filename (e.g., "_full" or "_filtered")
+        suffix: Optional suffix for output filename
 
     Returns:
         Path to compressed/indexed VCF, or None if failed
@@ -295,4 +279,3 @@ def prepare_gnomad_vcf(vcf_path: Path, output_dir: Path, suffix: str = "") -> Pa
 
     logger.debug(f"Prepared gnomAD VCF: {output_vcf_gz}")
     return output_vcf_gz
-

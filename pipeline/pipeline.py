@@ -46,6 +46,35 @@ def _validate_percent(name: str, value) -> float:
     return value
 
 
+def _validate_positive_int_field(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise TypeError(f"{name} must be a positive integer, got: {value!r}")
+    return value
+
+
+def _validate_positive_number_field(name: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or float(value) <= 0:
+        raise TypeError(f"{name} must be a positive number, got: {value!r}")
+    return float(value)
+
+
+def _validate_fraction_field(name: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise TypeError(f"{name} must be a number in [0, 1], got: {value!r}")
+    value = float(value)
+    if value < 0 or value > 1:
+        raise ValueError(f"{name} must be in [0, 1], got: {value}")
+    return value
+
+
+def _validate_phred_field(name: str, value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise TypeError(f"{name} must be an integer in [0, 93], got: {value!r}")
+    if value < 0 or value > 93:
+        raise ValueError(f"{name} must be in [0, 93], got: {value}")
+    return value
+
+
 def _validate_positive_int(name: str, value) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise TypeError(f"bam_filtering.{name} must be a positive integer, got: {value!r}")
@@ -106,6 +135,18 @@ def main():
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
     with open(config_path) as f:
         cfg = json.load(f)
+    cfg["hitlist_size"] = _validate_positive_int_field(
+        "hitlist_size", cfg.get("hitlist_size", 5000)
+    )
+    cfg["blast_expect"] = _validate_positive_number_field(
+        "blast_expect", cfg.get("blast_expect", 10.0)
+    )
+    cfg["pseudo_read_phred"] = _validate_phred_field(
+        "pseudo_read_phred", cfg.get("pseudo_read_phred", 30)
+    )
+    cfg["min_var_freq"] = _validate_fraction_field(
+        "min_var_freq", cfg.get("min_var_freq", 0.2)
+    )
     cfg["bam_filtering"] = validate_bam_filtering_cfg(cfg)
     config.init(cfg)
 
@@ -129,7 +170,10 @@ def main():
         "run_id": run_id,
         "run_dir": str(run_dir),
         "gene_ids": cfg["gene_ids"],
-        "hitlist_size": cfg.get("hitlist_size", 5000),
+        "hitlist_size": cfg["hitlist_size"],
+        "blast_expect": cfg["blast_expect"],
+        "pseudo_read_phred": cfg["pseudo_read_phred"],
+        "min_var_freq": cfg["min_var_freq"],
         "bam_filtering": cfg["bam_filtering"],
         "config_path": str(config_path),
         "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -139,6 +183,12 @@ def main():
 
     logger.info(f"Run directory: {run_dir}")
     logger.info(f"Gene IDs: {cfg['gene_ids']}")
+    logger.info(f"BLAST parameters: hitlist_size={cfg['hitlist_size']}, expect={cfg['blast_expect']}")
+    logger.info(
+        "Variant parameters: pseudo_read_phred={}, min_var_freq={}",
+        cfg["pseudo_read_phred"],
+        cfg["min_var_freq"],
+    )
     logger.info(f"BAM filtering config: {cfg['bam_filtering']}")
 
     # Process each gene (ortholog source: NCBI Datasets -> BLAST fallback)

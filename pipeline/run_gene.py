@@ -58,16 +58,15 @@ def download_gene_seq(gene_id, work_dir):
     }
 
 
-def generate_pseudoreads(input_fastq, work_dir):
+def generate_pseudoreads(input_fastq, work_dir, phred: int = 30):
     """Create sliding window pseudoreads from ortholog sequences."""
     output_fastq = work_dir / "pseudo_reads.fastq"
     READ_LEN = 75
     STEP = 35
-    PHRED = 30
 
-    logger.info(f"Generating pseudoreads (read_len={READ_LEN}, step={STEP})")
+    logger.info(f"Generating pseudoreads (read_len={READ_LEN}, step={STEP}, phred={phred})")
 
-    phred_char = chr(PHRED + 33)
+    phred_char = chr(phred + 33)
     total_reads = 0
 
     with open(output_fastq, "w") as out:
@@ -107,7 +106,7 @@ def align_pseudoreads(work_dir):
     logger.success(f"Alignment complete -> {sorted_bam}")
 
 
-def call_variants(work_dir, bam_path: Path):
+def call_variants(work_dir, bam_path: Path, min_var_freq: float = 0.2):
     """Run VarScan variant calling."""
     logger.info("Calling variants with VarScan")
 
@@ -122,8 +121,14 @@ def call_variants(work_dir, bam_path: Path):
 
     config.run_bio(f"samtools faidx {ref}")
     config.run_bio(f"samtools mpileup -f {ref} {sorted_bam} > {pileup}")
-    config.run_bio(f"varscan mpileup2snp {pileup} --min-coverage 8 --min-reads2 2 --output-vcf 1 > {snps}")
-    config.run_bio(f"varscan mpileup2indel {pileup} --min-coverage 8 --min-reads2 2 --output-vcf 1 > {indels}")
+    config.run_bio(
+        f"varscan mpileup2snp {pileup} --min-coverage 8 --min-reads2 2 "
+        f"--min-var-freq {min_var_freq} --output-vcf 1 > {snps}"
+    )
+    config.run_bio(
+        f"varscan mpileup2indel {pileup} --min-coverage 8 --min-reads2 2 "
+        f"--min-var-freq {min_var_freq} --output-vcf 1 > {indels}"
+    )
 
     logger.success(f"Variant calling complete -> {snps}, {indels}")
 
@@ -263,6 +268,7 @@ def _fetch_orthologs(gene_id, work_dir, cfg):
         gene_id=gene_id,
         output_dir=work_dir,
         hitlist_size=cfg.get("hitlist_size", 5000),
+        expect=cfg.get("blast_expect", 10.0),
     )
 
 
@@ -293,7 +299,8 @@ def run_gene(gene_id, work_dir, cfg):
     Args:
         gene_id: NCBI Gene ID
         work_dir: Directory for this gene's outputs
-        cfg: Config dict with keys like 'hitlist_size', 'bam_filtering'
+        cfg: Config dict with keys like 'hitlist_size', 'blast_expect',
+             'pseudo_read_phred', 'min_var_freq', 'bam_filtering'
              and optional 'keep_intermediate_files'
     """
     work_dir = Path(work_dir)
@@ -313,7 +320,11 @@ def run_gene(gene_id, work_dir, cfg):
     logger.info(f"Retrieved {result.sequence_count} sequences from {result.species_count} species")
 
     # Step 3: Generate pseudoreads
-    generate_pseudoreads(input_fastq=str(result.fastq_path), work_dir=work_dir)
+    generate_pseudoreads(
+        input_fastq=str(result.fastq_path),
+        work_dir=work_dir,
+        phred=cfg.get("pseudo_read_phred", 30),
+    )
 
     # Step 4: Align pseudoreads
     align_pseudoreads(work_dir)
@@ -334,14 +345,18 @@ def run_gene(gene_id, work_dir, cfg):
         logger.info("BAM filtering disabled by config; using aln.sorted.bam")
 
     # Step 6: Call variants
-    call_variants(work_dir, bam_for_variants)
+    call_variants(
+        work_dir,
+        bam_for_variants,
+        min_var_freq=cfg.get("min_var_freq", 0.2),
+    )
 
     # Step 7: Normalize VCF
     if gene_coords:
         normalize_vcf(gene_coords, work_dir)
 
     # Step 8: Annotate variants with ClinVar and gnomAD
-    gnomad_vcf_full, _ = download_gnomad_for_gene(gene_id)
+    gnomad_vcf_full = download_gnomad_for_gene(gene_id)
     gnomad_gz = prepare_gnomad_vcf(gnomad_vcf_full, work_dir) if gnomad_vcf_full else None
     annotate_variants(work_dir, gnomad_gz)
 
