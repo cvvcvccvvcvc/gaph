@@ -13,6 +13,8 @@ from tqdm import tqdm
 from .base import OrthologResult, OrthologSource
 from .registry import register
 
+SOURCE_FASTQ_PHRED = 30
+
 
 @register
 class BlastOrthologSource(OrthologSource):
@@ -37,7 +39,7 @@ class BlastOrthologSource(OrthologSource):
         gene_id: int,
         output_dir: Path,
         hitlist_size: int = 100,
-        phred: int = 30,
+        expect: float = 10.0,
     ) -> OrthologResult:
         """Fetch orthologs via BLAST search.
 
@@ -45,7 +47,7 @@ class BlastOrthologSource(OrthologSource):
             gene_id: NCBI Gene ID
             output_dir: Directory to write output files
             hitlist_size: Maximum number of BLAST hits
-            phred: Quality score for FASTQ output
+            expect: BLAST E-value cutoff
 
         Returns:
             OrthologResult with path to FASTQ file
@@ -61,18 +63,16 @@ class BlastOrthologSource(OrthologSource):
         self._download_longest_protein(gene_id, protein_path)
 
         # Step 2: BLAST search
-        self._blast_search(protein_path, blast_path, hitlist_size)
+        self._blast_search(protein_path, blast_path, hitlist_size, expect)
 
         # Step 3: Parse BLAST and fetch sequences
-        species_count, sequence_count = self._obtain_sequences(
-            blast_path, fastq_path, phred
-        )
+        species_count, sequence_count = self._obtain_sequences(blast_path, fastq_path)
 
         return OrthologResult(
             fastq_path=fastq_path,
             species_count=species_count,
             sequence_count=sequence_count,
-            metadata={"hitlist_size": hitlist_size, "source": "blast"},
+            metadata={"hitlist_size": hitlist_size, "expect": expect, "source": "blast"},
         )
 
     def _download_longest_protein(self, gene_id: int, output_path: Path) -> None:
@@ -126,10 +126,14 @@ class BlastOrthologSource(OrthologSource):
                     raise
 
     def _blast_search(
-        self, protein_path: Path, output_path: Path, hitlist_size: int
+        self,
+        protein_path: Path,
+        output_path: Path,
+        hitlist_size: int,
+        expect: float,
     ) -> None:
         """Run BLASTP search against RefSeq with retry logic and progressive hitlist reduction."""
-        logger.info(f"Running BLAST search (hitlist_size={hitlist_size})")
+        logger.info(f"Running BLAST search (hitlist_size={hitlist_size}, expect={expect})")
 
         query_protein = SeqIO.read(protein_path, "fasta")
         logger.debug(f"Query protein length: {len(query_protein.seq)} aa")
@@ -138,7 +142,7 @@ class BlastOrthologSource(OrthologSource):
             program="blastp",
             database="refseq_protein",
             sequence=str(query_protein.seq),
-            expect=10,
+            expect=expect,
             hitlist_size=hitlist_size,
         )
 
@@ -156,9 +160,7 @@ class BlastOrthologSource(OrthologSource):
         logger.success(f"BLAST results saved to {output_path}")
         return
     
-    def _obtain_sequences(
-        self, blast_path: Path, output_path: Path, phred: int
-    ) -> tuple[int, int]:
+    def _obtain_sequences(self, blast_path: Path, output_path: Path) -> tuple[int, int]:
         """Parse BLAST results and fetch genomic sequences."""
         logger.info("Parsing BLAST results for homologous sequences")
 
@@ -182,7 +184,7 @@ class BlastOrthologSource(OrthologSource):
 
         # Fetch sequences and write FASTQ
         success_count, skip_count = self._fetch_and_write_sequences(
-            gene_ids, gene_coords, output_path, phred
+            gene_ids, gene_coords, output_path
         )
 
         logger.success(f"FASTQ saved: {success_count} sequences, {skip_count} skipped")
@@ -279,7 +281,6 @@ class BlastOrthologSource(OrthologSource):
         gene_ids: list[str],
         gene_coords: dict,
         output_path: Path,
-        phred: int,
     ) -> tuple[int, int]:
         """Fetch genomic sequences and write to FASTQ with retry logic."""
         success_count = 0
@@ -313,7 +314,7 @@ class BlastOrthologSource(OrthologSource):
                             if seq_len == 0:
                                 continue
 
-                            record.letter_annotations["phred_quality"] = [phred] * seq_len
+                            record.letter_annotations["phred_quality"] = [SOURCE_FASTQ_PHRED] * seq_len
                             record.id = f"gene_{gid}"
                             record.description = ""
 

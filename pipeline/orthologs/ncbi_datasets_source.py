@@ -11,6 +11,8 @@ from loguru import logger
 from .base import OrthologResult, OrthologSource
 from .registry import register
 
+SOURCE_FASTQ_PHRED = 30
+
 
 @register
 class NCBIDatasetsOrthologSource(OrthologSource):
@@ -64,14 +66,12 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         self,
         gene_id: int,
         output_dir: Path,
-        phred: int = 30,
     ) -> OrthologResult:
         """Fetch orthologs via NCBI Datasets CLI.
 
         Args:
             gene_id: NCBI Gene ID
             output_dir: Directory to write output files
-            phred: Quality score for FASTQ output
 
         Returns:
             OrthologResult with path to FASTQ file
@@ -91,9 +91,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         self._extract_zip(zip_path, output_dir)
 
         # Step 3: Read gene sequences from gene.fna and convert to FASTQ
-        species_count, sequence_count = self._fetch_sequences(
-            data_dir, fastq_path, phred
-        )
+        species_count, sequence_count = self._fetch_sequences(data_dir, fastq_path)
 
         return OrthologResult(
             fastq_path=fastq_path,
@@ -142,9 +140,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
 
         logger.debug("Extraction complete")
 
-    def _fetch_sequences(
-        self, data_dir: Path, output_path: Path, phred: int
-    ) -> tuple[int, int]:
+    def _fetch_sequences(self, data_dir: Path, output_path: Path) -> tuple[int, int]:
         """Read gene sequences from gene.fna and convert to FASTQ.
 
         Deduplicates sequences: keeps one per organism, preferring NC_ accessions
@@ -196,7 +192,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         with open(output_path, "w") as out:
             for org, record in by_organism.items():
                 # Add phred quality scores
-                record.letter_annotations["phred_quality"] = [phred] * len(record.seq)
+                record.letter_annotations["phred_quality"] = [SOURCE_FASTQ_PHRED] * len(record.seq)
 
                 # Extract gene_id from description if available
                 if "[GeneID=" in record.description:

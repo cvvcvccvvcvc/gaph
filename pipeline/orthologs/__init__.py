@@ -17,7 +17,12 @@ Usage:
 
     # Or use a specific source
     source = get_source("blast")
-    result = source.fetch(gene_id=672, output_dir=Path("gene_672"), hitlist_size=5000)
+    result = source.fetch(
+        gene_id=672,
+        output_dir=Path("gene_672"),
+        hitlist_size=5000,
+        expect=10.0,
+    )
 
     # Access results
     print(result.fastq_path)      # Path to FASTQ file
