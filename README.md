@@ -39,6 +39,9 @@ Example:
 {
   "gene_ids": [672],
   "hitlist_size": 5000,
+  "blast_expect": 10.0,
+  "pseudo_read_phred": 30,
+  "min_var_freq": 0.2,
   "env_file": ".env",
   "data_dir": "data",
   "runs_dir": "runs",
@@ -65,6 +68,16 @@ Example:
   - `min_kept_pct_of_reference`
 - `read_len` and `step` are optional positive integers (default `75` and `35`).
 - If `min_mapped_pct_of_generated` is enabled and generated pseudo-read counts cannot be computed for homologues, gene processing fails fast.
+
+### BLAST parameters
+
+- `hitlist_size`: max number of BLAST hits to request.
+- `blast_expect`: BLAST E-value cutoff (passed to `qblast(..., expect=...)`).
+
+### Variant calling parameters
+
+- `pseudo_read_phred`: fixed PHRED assigned to generated pseudo-reads.
+- `min_var_freq`: passed to VarScan as `--min-var-freq`.
 
 ## Outputs
 

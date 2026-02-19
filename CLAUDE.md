@@ -36,6 +36,9 @@ All settings are in `config.json`:
 {
   "gene_ids": [672],
   "hitlist_size": 5000,
+  "blast_expect": 10.0,
+  "pseudo_read_phred": 30,
+  "min_var_freq": 0.2,
   "env_file": "~/.secrets.env",
   "data_dir": "data",
   "runs_dir": "runs",
@@ -54,6 +57,10 @@ All settings are in `config.json`:
 ```
 
 - `env_file` — path to `.env` file containing `ENTREZ_EMAIL` and `ENTREZ_API_KEY` (tilde-expanded). Secrets stay out of config.json.
+- `hitlist_size` — max number of BLAST hits
+- `blast_expect` — BLAST E-value cutoff (`qblast expect`)
+- `pseudo_read_phred` — fixed PHRED for generated pseudo-reads
+- `min_var_freq` — VarScan `--min-var-freq` parameter
 - `data_dir`, `runs_dir`, `gnomad_dir` — relative to repo root, or absolute paths
 - `conda_env` — name of the conda environment (default: `bio`)
 - `keep_intermediate_files` — keep all per-gene intermediates when `true`; default `false` keeps only `gene_snps_annotated.vcf` in each gene output folder
@@ -81,7 +88,7 @@ micromamba run -n bio samtools index aln.sorted.bam
 ```bash
 micromamba run -n bio samtools faidx reference.fasta
 micromamba run -n bio samtools mpileup -f reference.fasta aln.sorted.bam > pileup.mpileup
-micromamba run -n bio varscan mpileup2snp pileup.mpileup --min-coverage 8 --min-reads2 2 --output-vcf 1 > snps.vcf
+micromamba run -n bio varscan mpileup2snp pileup.mpileup --min-coverage 8 --min-reads2 2 --min-var-freq 0.2 --output-vcf 1 > snps.vcf
 ```
 
 ### VCF Processing & Annotation
