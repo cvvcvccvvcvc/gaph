@@ -1,0 +1,23 @@
+name: bio
+channels:
+  - conda-forge
+  - bioconda
+  - defaults
+dependencies:
+  - python=3.11
+  - bwa=0.7.18
+  - samtools=1.21
+  - bcftools=1.21
+  - htslib=1.21
+  - varscan=2.4.6
+  - ncbi-datasets-cli
+  - biopython
+  - pysam
+  - pandas
+  - numpy
+  - matplotlib
+  - tqdm
+  - loguru
+  - pip
+  - pip:
+    - gql[aiohttp]>=3.5

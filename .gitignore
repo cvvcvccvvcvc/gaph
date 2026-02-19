@@ -1,0 +1,16 @@
+runs/
+pipeline/runs/
+.venv/
+data/
+gnomad_variants/
+9_random_align/
+_cluster/
+config.json
+__pycache__/
+*.pyc
+.DS_Store
+.ipynb_checkpoints/
+analysis/
+.env
+gnomad_variants/
+tests/
