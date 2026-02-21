@@ -79,16 +79,8 @@ class BlastOrthologSource(OrthologSource):
         """Download the longest protein isoform for a gene with retry logic."""
         logger.info(f"Downloading longest protein isoform for gene {gene_id}")
 
-        links = Entrez.read(
-            Entrez.elink(
-                dbfrom="gene",
-                db="protein",
-                id=str(gene_id),
-                linkname="gene_protein_refseq",
-            )
-        )
-        protein_ids = [link["Id"] for link in links[0]["LinkSetDb"][0]["Link"]]
-        logger.info(f"Found {len(protein_ids)} proteins")
+        protein_ids, linkname_used = self._get_protein_ids_for_gene(gene_id)
+        logger.info(f"Found {len(protein_ids)} proteins (source={linkname_used})")
 
         max_retries = 3
         retry_delay = 5
@@ -107,6 +99,9 @@ class BlastOrthologSource(OrthologSource):
                 handle.close()
                 logger.info(f"Fetched {len(records)} sequences")
 
+                if not records:
+                    raise RuntimeError(f"No protein sequences fetched for gene {gene_id}")
+
                 longest = max(records, key=lambda r: len(r.seq))
                 logger.info(f"Longest isoform: {longest.id} ({len(longest.seq)} aa)")
 
@@ -124,6 +119,33 @@ class BlastOrthologSource(OrthologSource):
                 else:
                     logger.error(f"Failed to download protein after {max_retries} attempts")
                     raise
+
+    def _get_protein_ids_for_gene(self, gene_id: int) -> tuple[list[str], str]:
+        """Resolve protein IDs for gene using RefSeq proteins only."""
+        linkname = "gene_protein_refseq"
+        with Entrez.elink(
+            dbfrom="gene",
+            db="protein",
+            id=str(gene_id),
+            linkname=linkname,
+        ) as handle:
+            links = Entrez.read(handle)
+
+        linksetdb = links[0].get("LinkSetDb", []) if links else []
+        protein_ids: list[str] = []
+        for db in linksetdb:
+            for link in db.get("Link", []):
+                pid = link.get("Id")
+                if pid:
+                    protein_ids.append(pid)
+
+        protein_ids = list(dict.fromkeys(protein_ids))
+        if protein_ids:
+            return protein_ids, linkname
+
+        raise RuntimeError(
+            f"No RefSeq protein IDs found for gene {gene_id} via linkname {linkname}"
+        )
 
     def _blast_search(
         self,

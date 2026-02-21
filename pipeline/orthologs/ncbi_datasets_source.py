@@ -1,11 +1,15 @@
 """NCBI Datasets CLI-based ortholog source implementation."""
 
+import gzip
+import json
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from pathlib import Path
 
 from Bio import SeqIO
+from Bio.SeqRecord import SeqRecord
 from loguru import logger
 
 from .base import OrthologResult, OrthologSource
@@ -62,6 +66,106 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         candidates = ", ".join(self._candidate_commands())
         raise RuntimeError(f"datasets CLI not found. Tried: {candidates}")
 
+    @staticmethod
+    def _cache_fastq_path(cache_dir: Path, gene_id: int) -> Path:
+        return Path(cache_dir) / f"gene_{gene_id}.fastq.gz"
+
+    @staticmethod
+    def _cache_meta_path(cache_dir: Path, gene_id: int) -> Path:
+        return Path(cache_dir) / f"gene_{gene_id}.meta.json"
+
+    def has_cached(self, gene_id: int, cache_dir: Path) -> bool:
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+        return cache_fastq.exists() and cache_fastq.stat().st_size > 0
+
+    def load_cached(self, gene_id: int, cache_dir: Path, output_fastq: Path) -> OrthologResult | None:
+        """Restore cached ortholog FASTQ to output_fastq if present."""
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+        if not cache_fastq.exists():
+            return None
+
+        output_fastq.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(cache_fastq, "rb") as src, open(output_fastq, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+        meta = self._read_cache_meta(gene_id, cache_dir)
+        if meta:
+            species_count = int(meta.get("species_count", 0))
+            sequence_count = int(meta.get("sequence_count", 0))
+        else:
+            sequence_count = self._count_fastq_records(output_fastq)
+            species_count = sequence_count
+
+        logger.info(f"Using cached NCBI orthologs for gene {gene_id}: {cache_fastq}")
+        return OrthologResult(
+            fastq_path=output_fastq,
+            species_count=species_count,
+            sequence_count=sequence_count,
+            metadata={"source": "ncbi_datasets_cache", "gene_id": gene_id},
+        )
+
+    def save_to_cache(
+        self,
+        gene_id: int,
+        cache_dir: Path,
+        source_fastq: Path,
+        species_count: int,
+        sequence_count: int,
+        source_tag: str = "ncbi_datasets",
+    ) -> Path:
+        """Save an ortholog FASTQ to persistent cache as gzip."""
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+        with open(source_fastq, "rb") as src, gzip.open(cache_fastq, "wb", compresslevel=1) as dst:
+            shutil.copyfileobj(src, dst)
+
+        self._write_cache_meta(
+            gene_id=gene_id,
+            cache_dir=cache_dir,
+            source=source_tag,
+            species_count=species_count,
+            sequence_count=sequence_count,
+        )
+        return cache_fastq
+
+    def _write_cache_meta(
+        self,
+        gene_id: int,
+        cache_dir: Path,
+        source: str,
+        species_count: int,
+        sequence_count: int,
+    ) -> None:
+        meta_path = self._cache_meta_path(cache_dir, gene_id)
+        payload = {
+            "gene_id": int(gene_id),
+            "source": source,
+            "species_count": int(species_count),
+            "sequence_count": int(sequence_count),
+        }
+        with open(meta_path, "w") as f:
+            json.dump(payload, f, indent=2)
+
+    def _read_cache_meta(self, gene_id: int, cache_dir: Path) -> dict | None:
+        meta_path = self._cache_meta_path(cache_dir, gene_id)
+        if not meta_path.exists():
+            return None
+        try:
+            with open(meta_path) as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _count_fastq_records(fastq_path: Path) -> int:
+        lines = 0
+        with open(fastq_path) as fh:
+            for _ in fh:
+                lines += 1
+        return lines // 4
+
     def fetch(
         self,
         gene_id: int,
@@ -99,6 +203,207 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             sequence_count=sequence_count,
             metadata={"source": "ncbi_datasets", "gene_id": gene_id},
         )
+
+    def prefetch_to_cache(self, gene_ids: list[int], cache_dir: Path) -> set[int]:
+        """Batch-download orthologs for many query genes and write per-gene cache files.
+
+        Only writes processed per-gene FASTQ cache files (gzip), no persistent raw batch zip.
+        Returns gene IDs for which cached FASTQ was produced.
+        """
+        cache_dir = Path(cache_dir)
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        dedup_gene_ids: list[int] = []
+        seen: set[int] = set()
+        for gid in gene_ids:
+            gid_int = int(gid)
+            if gid_int in seen:
+                continue
+            seen.add(gid_int)
+            dedup_gene_ids.append(gid_int)
+
+        missing = [gid for gid in dedup_gene_ids if not self.has_cached(gid, cache_dir)]
+        if not missing:
+            return set()
+
+        requested = {str(gid) for gid in missing}
+        logger.info(f"Batch downloading NCBI orthologs for {len(missing)} gene(s)")
+
+        with tempfile.TemporaryDirectory(prefix="ncbi_prefetch_", dir=str(cache_dir)) as tmp:
+            tmp_dir = Path(tmp)
+            input_ids = tmp_dir / "gene_ids.txt"
+            batch_zip = tmp_dir / "ncbi_dataset_batch.zip"
+            input_ids.write_text("\n".join(str(gid) for gid in missing) + "\n")
+
+            self._download_orthologs_batch(input_ids, tmp_dir, batch_zip)
+            self._extract_zip(batch_zip, tmp_dir)
+
+            data_dir = tmp_dir / "ncbi_dataset" / "data"
+            grouped = self._collect_records_by_query_gene(data_dir, requested)
+
+            produced: set[int] = set()
+            for gid in missing:
+                by_organism = grouped.get(str(gid), {})
+                if not by_organism:
+                    continue
+
+                tmp_fastq = tmp_dir / f"gene_{gid}.fastq"
+                species_count, sequence_count = self._write_records_fastq(by_organism, tmp_fastq)
+                self.save_to_cache(
+                    gene_id=gid,
+                    cache_dir=cache_dir,
+                    source_fastq=tmp_fastq,
+                    species_count=species_count,
+                    sequence_count=sequence_count,
+                    source_tag="ncbi_datasets_batch",
+                )
+                produced.add(gid)
+
+        logger.info(
+            "NCBI batch prefetch finished: {} cached, {} missing",
+            len(produced),
+            len(missing) - len(produced),
+        )
+        return produced
+
+    def _download_orthologs_batch(
+        self,
+        gene_ids_file: Path,
+        output_dir: Path,
+        zip_path: Path,
+    ) -> None:
+        """Download batch ortholog data using datasets CLI input file."""
+        datasets_cmd = self._get_datasets_cmd()
+        cmd = [
+            datasets_cmd,
+            "download",
+            "gene",
+            "gene-id",
+            "--inputfile",
+            str(gene_ids_file),
+            "--ortholog",
+            "all",
+            "--include",
+            "gene",
+            "--filename",
+            str(zip_path),
+        ]
+
+        logger.debug(f"Running: {' '.join(cmd)}")
+        result = subprocess.run(cmd, capture_output=True, text=True, cwd=output_dir)
+        if result.returncode != 0:
+            logger.error(f"datasets CLI batch failed: {result.stderr}")
+            raise RuntimeError(f"datasets batch download failed: {result.stderr}")
+
+    def _collect_records_by_query_gene(
+        self,
+        data_dir: Path,
+        requested_query_gene_ids: set[str],
+    ) -> dict[str, dict[str, SeqRecord]]:
+        """Collect and deduplicate FASTA records grouped by query-gene ID."""
+        report_path = data_dir / "data_report.jsonl"
+        gene_fna = data_dir / "gene.fna"
+        if not report_path.exists() or not gene_fna.exists():
+            raise FileNotFoundError(f"Expected files not found in {data_dir}")
+
+        ortholog_to_query = self._build_ortholog_to_query_map(report_path, requested_query_gene_ids)
+        grouped: dict[str, dict[str, SeqRecord]] = {gid: {} for gid in requested_query_gene_ids}
+
+        for record in SeqIO.parse(gene_fna, "fasta"):
+            ortholog_gene_id = self._extract_gene_id(record.description)
+            if not ortholog_gene_id:
+                continue
+
+            query_gene_id = ortholog_to_query.get(ortholog_gene_id)
+            if not query_gene_id:
+                continue
+
+            organism = self._extract_organism(record.description)
+            if not organism or organism.lower() == "homo sapiens":
+                continue
+
+            by_org = grouped.setdefault(query_gene_id, {})
+            if organism not in by_org:
+                by_org[organism] = record
+                continue
+
+            current = by_org[organism]
+            curr_is_nc = current.id.startswith("NC_")
+            new_is_nc = record.id.startswith("NC_")
+            if new_is_nc and not curr_is_nc:
+                by_org[organism] = record
+            elif curr_is_nc == new_is_nc and len(record.seq) > len(current.seq):
+                by_org[organism] = record
+
+        return grouped
+
+    @staticmethod
+    def _build_ortholog_to_query_map(report_path: Path, requested_query_gene_ids: set[str]) -> dict[str, str]:
+        """Map ortholog GeneID -> requested query GeneID using data_report.jsonl."""
+        mapping: dict[str, str] = {}
+        with open(report_path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+                ortholog_gene_id = str(row.get("geneId", "")).strip()
+                if not ortholog_gene_id:
+                    continue
+
+                if ortholog_gene_id in requested_query_gene_ids:
+                    mapping[ortholog_gene_id] = ortholog_gene_id
+                    continue
+
+                groups = row.get("geneGroups") or []
+                query_gene_id = None
+                for group in groups:
+                    if not isinstance(group, dict):
+                        continue
+                    group_id = str(group.get("id", "")).strip()
+                    if group_id in requested_query_gene_ids:
+                        query_gene_id = group_id
+                        break
+
+                if query_gene_id:
+                    mapping[ortholog_gene_id] = query_gene_id
+
+        return mapping
+
+    @staticmethod
+    def _extract_organism(description: str) -> str | None:
+        if "[organism=" not in description:
+            return None
+        return description.split("[organism=")[1].split("]")[0]
+
+    @staticmethod
+    def _extract_gene_id(description: str) -> str | None:
+        if "[GeneID=" not in description:
+            return None
+        return description.split("[GeneID=")[1].split("]")[0]
+
+    def _write_records_fastq(
+        self,
+        by_organism: dict[str, SeqRecord],
+        output_fastq: Path,
+    ) -> tuple[int, int]:
+        """Write deduplicated records to FASTQ (one record per organism)."""
+        with open(output_fastq, "w") as out:
+            for record in by_organism.values():
+                rec = record[:]
+                gene_id = self._extract_gene_id(record.description)
+                if gene_id:
+                    rec.id = f"gene_{gene_id}"
+                rec.description = ""
+                rec.letter_annotations["phred_quality"] = [SOURCE_FASTQ_PHRED] * len(rec.seq)
+                SeqIO.write(rec, out, "fastq")
+
+        count = len(by_organism)
+        return count, count
 
     def _download_orthologs(
         self, gene_id: int, output_dir: Path, zip_path: Path
