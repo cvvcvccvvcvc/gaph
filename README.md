@@ -45,6 +45,7 @@ Example:
   "env_file": ".env",
   "data_dir": "data",
   "runs_dir": "runs",
+  "resume_run_dir": "runs/run_20260221_125031",
   "gnomad_dir": "gnomad_variants",
   "conda_env": "bio",
   "keep_intermediate_files": false,
@@ -58,6 +59,19 @@ Example:
   }
 }
 ```
+
+### Resume an existing run
+
+- `resume_run_dir` is optional.
+- If omitted, pipeline creates a new `runs/run_YYYYMMDD_HHMMSS` directory.
+- If provided, pipeline inspects configured genes in order and resumes from:
+  - the first gene with a non-terminal state (`gene_<id>/` exists but no `gene_snps_annotated.vcf` and no `failure.json`), or
+  - the first missing gene directory if all previous genes are terminal.
+- Terminal state is one of:
+  - `gene_snps_annotated.vcf` exists and is non-empty (success)
+  - `failure.json` exists and is non-empty (failed)
+- If all genes are terminal in `resume_run_dir`, a new run directory is created automatically.
+- In resume mode, existing terminal genes are skipped; incomplete gene directories are deleted and recomputed from scratch.
 
 ### `bam_filtering` rules
 

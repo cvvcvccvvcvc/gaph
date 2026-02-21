@@ -1,0 +1,52 @@
+# Config Contract
+
+Use this when changing `config.json` schema or behavior.
+
+## Where Config Is Validated
+
+Validation happens in `pipeline/pipeline.py` before processing genes:
+- numeric core fields: `pipeline/pipeline.py:198` to `pipeline/pipeline.py:209`
+- resume run path: `pipeline/pipeline.py:197`, `pipeline/pipeline.py:296`
+- BAM filtering block: `pipeline/pipeline.py:86`
+- cache block: `pipeline/pipeline.py:135`
+
+If you add a config field, update validation here first.
+
+## Runtime Initialization
+
+Resolved paths, env-file loading, and conda resolver are in `pipeline/config.py:81`.
+Critical details:
+- `env_file` is parsed in `pipeline/config.py:93`
+- project paths are resolved relative to repo root via `pipeline/config.py:33`
+- bio commands run through `run_bio(...)` in `pipeline/config.py:121`
+- `resume_run_dir` (if set) is resolved relative to repo root via `pipeline/pipeline.py:206`
+
+## Resume Rules
+
+- Optional config field: `resume_run_dir` (string path to existing run folder).
+- Gene terminal states in resume mode (`pipeline/pipeline.py:229`):
+  - success: `gene_snps_annotated.vcf` exists and non-empty
+  - failed: `failure.json` exists and non-empty
+- Resume start point is first non-terminal gene in config order (`pipeline/pipeline.py:243`).
+- If all genes are terminal, pipeline starts a new run directory (`pipeline/pipeline.py:316`).
+
+## BAM Filtering Rules
+
+- `bam_filtering` block is required by current validator (`pipeline/pipeline.py:88`)
+- required thresholds when enabled: `pipeline/pipeline.py:108`
+- fail-fast on missing generated counts is enforced in filtering module: `pipeline/bam_filtering.py:506`
+
+## Cache Rules
+
+- cache flags are normalized in `pipeline/pipeline.py:159`
+- cache paths are expanded in `pipeline/config.py:108` to `pipeline/config.py:114`
+- ortholog cache writes currently use gzip `compresslevel=1`:
+  - `pipeline/run_gene.py:86`
+  - `pipeline/orthologs/ncbi_datasets_source.py:121`
+
+## Change Checklist
+
+1. Update validator(s) in `pipeline/pipeline.py`.
+2. Update runtime usage in `pipeline/config.py` and/or `pipeline/run_gene.py`.
+3. Keep `config.json` example(s) aligned.
+4. Run a small real pipeline run and verify `run_params.json` captures new fields (`pipeline/pipeline.py:230`).
