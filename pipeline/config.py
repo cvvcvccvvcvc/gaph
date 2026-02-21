@@ -22,6 +22,12 @@ CONDA_ENV_NAME = None
 CONDA_EXE = None
 ENTREZ_EMAIL = ""
 ENTREZ_API_KEY = ""
+CACHE_CFG = {}
+ORTHOLOG_CACHE_DIR = None
+NCBI_ORTHOLOG_CACHE_DIR = None
+BLAST_ORTHOLOG_CACHE_DIR = None
+GENE_SEQ_CACHE_DIR = None
+NCBI_TO_ENSEMBL_CACHE_FILE = None
 
 
 def _resolve_path(p):
@@ -76,6 +82,8 @@ def init(cfg: dict):
     """Initialize config from parsed JSON dict."""
     global DATA_DIR, RUNS_DIR, GNOMAD_CACHE_DIR, CLINVAR_VCF
     global CONDA_ENV_NAME, CONDA_EXE, ENTREZ_EMAIL, ENTREZ_API_KEY
+    global CACHE_CFG, ORTHOLOG_CACHE_DIR, NCBI_ORTHOLOG_CACHE_DIR
+    global BLAST_ORTHOLOG_CACHE_DIR, GENE_SEQ_CACHE_DIR, NCBI_TO_ENSEMBL_CACHE_FILE
 
     # Reset credentials on every init() to avoid stale values across re-initialization.
     ENTREZ_EMAIL = ""
@@ -91,8 +99,19 @@ def init(cfg: dict):
     # Paths
     DATA_DIR = _resolve_path(cfg.get("data_dir", "data"))
     RUNS_DIR = _resolve_path(cfg.get("runs_dir", "runs"))
-    GNOMAD_CACHE_DIR = _resolve_path(cfg.get("gnomad_dir", "gnomad_variants"))
+    GNOMAD_CACHE_DIR = _resolve_path(cfg.get("gnomad_dir", DATA_DIR / "gnomad_variants"))
     CLINVAR_VCF = DATA_DIR / "clinvar.vcf.gz"
+
+    # Cache paths and switches
+    raw_cache_cfg = cfg.get("cache", {})
+    CACHE_CFG = raw_cache_cfg if isinstance(raw_cache_cfg, dict) else {}
+    ORTHOLOG_CACHE_DIR = _resolve_path(CACHE_CFG.get("ortholog_cache_dir", DATA_DIR / "ortholog_cache"))
+    NCBI_ORTHOLOG_CACHE_DIR = ORTHOLOG_CACHE_DIR / "ncbi_datasets"
+    BLAST_ORTHOLOG_CACHE_DIR = ORTHOLOG_CACHE_DIR / "blast"
+    GENE_SEQ_CACHE_DIR = _resolve_path(CACHE_CFG.get("gene_seq_cache_dir", DATA_DIR / "gene_seq_cache"))
+    NCBI_TO_ENSEMBL_CACHE_FILE = _resolve_path(
+        CACHE_CFG.get("ncbi_to_ensembl_cache_file", DATA_DIR / "ncbi_to_ensembl_cache.json")
+    )
 
     # Conda
     CONDA_ENV_NAME = cfg.get("conda_env", "bio")

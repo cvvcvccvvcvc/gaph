@@ -3,6 +3,8 @@
 All functions take an explicit work_dir parameter — no os.chdir().
 """
 
+import gzip
+import json
 import re
 import shutil
 from io import StringIO
@@ -14,11 +16,138 @@ from loguru import logger
 import config
 from bam_filtering import filter_bam_for_gene
 from gnomad import download_gnomad_for_gene, prepare_gnomad_vcf
-from orthologs import get_source
+from orthologs import OrthologResult, get_source
 
 
-def download_gene_seq(gene_id, work_dir):
+def _cache_enabled(cfg: dict, key: str) -> bool:
+    cache_cfg = cfg.get("cache", {})
+    return bool(cache_cfg.get("enabled", True) and cache_cfg.get(key, True))
+
+
+def _ortholog_cache_paths(gene_id: int, source_name: str) -> tuple[Path, Path]:
+    if source_name == "ncbi_datasets":
+        base = config.NCBI_ORTHOLOG_CACHE_DIR
+    elif source_name == "blast":
+        base = config.BLAST_ORTHOLOG_CACHE_DIR
+    else:
+        raise ValueError(f"Unknown ortholog cache source: {source_name}")
+    return base / f"gene_{gene_id}.fastq.gz", base / f"gene_{gene_id}.meta.json"
+
+
+def _count_fastq_records(fastq_path: Path) -> int:
+    lines = 0
+    with open(fastq_path) as fh:
+        for _ in fh:
+            lines += 1
+    return lines // 4
+
+
+def _load_ortholog_cache(gene_id: int, source_name: str, work_dir: Path) -> tuple[int, int] | None:
+    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name)
+    if not cache_fastq_gz.exists() or cache_fastq_gz.stat().st_size == 0:
+        return None
+
+    work_fastq = work_dir / "genes_from_coordinates.fastq"
+    with gzip.open(cache_fastq_gz, "rb") as src, open(work_fastq, "wb") as dst:
+        shutil.copyfileobj(src, dst)
+
+    species_count = 0
+    sequence_count = 0
+    if cache_meta.exists():
+        try:
+            with open(cache_meta) as f:
+                meta = json.load(f)
+            species_count = int(meta.get("species_count", 0))
+            sequence_count = int(meta.get("sequence_count", 0))
+        except Exception:
+            species_count = 0
+            sequence_count = 0
+
+    if species_count <= 0 or sequence_count <= 0:
+        sequence_count = _count_fastq_records(work_fastq)
+        species_count = sequence_count
+
+    if sequence_count <= 0:
+        return None
+
+    return species_count, sequence_count
+
+
+def _save_ortholog_cache(
+    gene_id: int,
+    source_name: str,
+    fastq_path: Path,
+    species_count: int,
+    sequence_count: int,
+) -> None:
+    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name)
+    cache_fastq_gz.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(fastq_path, "rb") as src, gzip.open(cache_fastq_gz, "wb", compresslevel=1) as dst:
+        shutil.copyfileobj(src, dst)
+
+    payload = {
+        "gene_id": int(gene_id),
+        "source": source_name,
+        "species_count": int(species_count),
+        "sequence_count": int(sequence_count),
+    }
+    with open(cache_meta, "w") as f:
+        json.dump(payload, f, indent=2)
+
+
+def _gene_seq_cache_paths(gene_id: int) -> tuple[Path, Path]:
+    return (
+        config.GENE_SEQ_CACHE_DIR / f"gene_{gene_id}.fasta",
+        config.GENE_SEQ_CACHE_DIR / f"gene_{gene_id}.coords.json",
+    )
+
+
+def _load_gene_seq_cache(gene_id: int, work_dir: Path) -> dict | None:
+    cache_fasta, cache_coords = _gene_seq_cache_paths(gene_id)
+    if not cache_fasta.exists() or not cache_coords.exists():
+        return None
+
+    with open(cache_coords) as f:
+        coords = json.load(f)
+
+    shutil.copy(cache_fasta, work_dir / "gene_seq.fasta")
+    return {
+        "chr_acc": coords["chr_acc"],
+        "start": int(coords["start"]),
+        "end": int(coords["end"]),
+    }
+
+
+def _save_gene_seq_cache(gene_id: int, work_dir: Path, coords: dict) -> None:
+    cache_fasta, cache_coords = _gene_seq_cache_paths(gene_id)
+    cache_fasta.parent.mkdir(parents=True, exist_ok=True)
+
+    shutil.copy(work_dir / "gene_seq.fasta", cache_fasta)
+    with open(cache_coords, "w") as f:
+        json.dump(
+            {
+                "gene_id": int(gene_id),
+                "chr_acc": coords["chr_acc"],
+                "start": int(coords["start"]),
+                "end": int(coords["end"]),
+            },
+            f,
+            indent=2,
+        )
+
+
+def download_gene_seq(gene_id, work_dir, cfg):
     """Download gene sequence and return genomic coordinates."""
+    if _cache_enabled(cfg, "gene_seq"):
+        try:
+            cached_coords = _load_gene_seq_cache(gene_id, work_dir)
+            if cached_coords:
+                logger.info(f"Using cached gene sequence for gene {gene_id}")
+                return cached_coords
+        except Exception as e:
+            logger.warning(f"Failed to use cached gene sequence for {gene_id}: {e}")
+
     logger.info(f"Downloading gene sequence for gene {gene_id}")
 
     handle = Entrez.esummary(db="gene", id=str(gene_id), retmode="xml")
@@ -51,11 +180,19 @@ def download_gene_seq(gene_id, work_dir):
     SeqIO.write(records, work_dir / "gene_seq.fasta", "fasta")
     logger.success("Saved gene_seq.fasta")
 
-    return {
+    coords_out = {
         "chr_acc": chr_acc,
         "start": min(start, end),
         "end": max(start, end),
     }
+
+    if _cache_enabled(cfg, "gene_seq"):
+        try:
+            _save_gene_seq_cache(gene_id, work_dir, coords_out)
+        except Exception as e:
+            logger.warning(f"Failed to cache gene sequence for {gene_id}: {e}")
+
+    return coords_out
 
 
 def generate_pseudoreads(input_fastq, work_dir, phred: int = 30):
@@ -251,12 +388,61 @@ def annotate_variants(work_dir, gnomad_vcf_gz=None):
 
 
 def _fetch_orthologs(gene_id, work_dir, cfg):
-    """Fetch orthologs: try NCBI Datasets first, fall back to BLAST on failure."""
+    """Fetch orthologs with cache reuse: NCBI cache -> BLAST cache -> live fetches."""
+    output_fastq = Path(work_dir) / "genes_from_coordinates.fastq"
+
+    if _cache_enabled(cfg, "orthologs_ncbi"):
+        cached = _load_ortholog_cache(gene_id, "ncbi_datasets", Path(work_dir))
+        if cached:
+            species_count, sequence_count = cached
+            logger.info(f"Using cached NCBI orthologs for gene {gene_id}")
+
+            return OrthologResult(
+                fastq_path=output_fastq,
+                species_count=species_count,
+                sequence_count=sequence_count,
+                metadata={"source": "ncbi_datasets_cache", "gene_id": gene_id},
+            )
+
+    if _cache_enabled(cfg, "orthologs_blast"):
+        cached = _load_ortholog_cache(gene_id, "blast", Path(work_dir))
+        if cached:
+            species_count, sequence_count = cached
+            logger.info(f"Using cached BLAST orthologs for gene {gene_id}")
+
+            return OrthologResult(
+                fastq_path=output_fastq,
+                species_count=species_count,
+                sequence_count=sequence_count,
+                metadata={"source": "blast_cache", "gene_id": gene_id},
+            )
+
     ncbi_source = get_source("ncbi_datasets")
     try:
         logger.info("Fetching orthologs with ncbi_datasets source")
         result = ncbi_source.fetch(gene_id=gene_id, output_dir=work_dir)
         if result.sequence_count > 0:
+            if _cache_enabled(cfg, "orthologs_ncbi"):
+                try:
+                    if hasattr(ncbi_source, "save_to_cache"):
+                        ncbi_source.save_to_cache(
+                            gene_id=gene_id,
+                            cache_dir=config.NCBI_ORTHOLOG_CACHE_DIR,
+                            source_fastq=result.fastq_path,
+                            species_count=result.species_count,
+                            sequence_count=result.sequence_count,
+                            source_tag="ncbi_datasets",
+                        )
+                    else:
+                        _save_ortholog_cache(
+                            gene_id=gene_id,
+                            source_name="ncbi_datasets",
+                            fastq_path=result.fastq_path,
+                            species_count=result.species_count,
+                            sequence_count=result.sequence_count,
+                        )
+                except Exception as e:
+                    logger.warning(f"Failed to cache NCBI orthologs for gene {gene_id}: {e}")
             return result
         logger.warning("ncbi_datasets returned 0 sequences, falling back to BLAST")
     except Exception as e:
@@ -264,12 +450,24 @@ def _fetch_orthologs(gene_id, work_dir, cfg):
 
     logger.info("Fetching orthologs with blast source")
     blast_source = get_source("blast")
-    return blast_source.fetch(
+    result = blast_source.fetch(
         gene_id=gene_id,
         output_dir=work_dir,
         hitlist_size=cfg.get("hitlist_size", 5000),
         expect=cfg.get("blast_expect", 10.0),
     )
+    if _cache_enabled(cfg, "orthologs_blast") and result.sequence_count > 0:
+        try:
+            _save_ortholog_cache(
+                gene_id=gene_id,
+                source_name="blast",
+                fastq_path=result.fastq_path,
+                species_count=result.species_count,
+                sequence_count=result.sequence_count,
+            )
+        except Exception as e:
+            logger.warning(f"Failed to cache BLAST orthologs for gene {gene_id}: {e}")
+    return result
 
 
 def _cleanup_gene_outputs(work_dir: Path, keep_paths: list[Path]) -> None:
@@ -312,7 +510,7 @@ def run_gene(gene_id, work_dir, cfg):
     logger.info(f"{'='*50}")
 
     # Step 1: Download gene sequence
-    gene_coords = download_gene_seq(gene_id, work_dir)
+    gene_coords = download_gene_seq(gene_id, work_dir, cfg)
 
     # Step 2: Obtain homologous sequences (NCBI Datasets -> BLAST fallback)
     result = _fetch_orthologs(gene_id, work_dir, cfg)
