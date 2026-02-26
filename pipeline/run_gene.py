@@ -7,6 +7,7 @@ import gzip
 import json
 import re
 import shutil
+import time
 from io import StringIO
 from pathlib import Path
 
@@ -283,15 +284,33 @@ def normalize_vcf(gene_coords, work_dir):
 
     snp_vcf = work_dir / "gene_snps.vcf"
     indel_vcf = work_dir / "gene_indels.vcf"
+    snp_local_norm_vcf = work_dir / "gene_snps_local_norm_snps.vcf"
+    indel_local_norm_vcf = work_dir / "gene_snps_local_norm_indels.vcf"
     snp_norm_vcf = work_dir / "gene_snps_normalized_snps.vcf"
     indel_norm_vcf = work_dir / "gene_snps_normalized_indels.vcf"
     output_vcf = work_dir / "gene_snps_normalized.vcf"
     output_vcf_gz = work_dir / "gene_snps_normalized.vcf.gz"
     output_vcf_tbi = Path(str(output_vcf_gz) + ".tbi")
     merge_unsorted_gz = work_dir / "gene_snps_normalized_merged.unsorted.vcf.gz"
+    ref_fasta = work_dir / "gene_seq.fasta"
 
-    snp_count = _normalize_single_vcf(snp_vcf, snp_norm_vcf, new_chrom, region_start)
-    indel_count = _normalize_single_vcf(indel_vcf, indel_norm_vcf, new_chrom, region_start)
+    snp_vcf_for_shift = _normalize_local_vcf_with_bcftools(
+        input_vcf=snp_vcf,
+        output_vcf=snp_local_norm_vcf,
+        ref_fasta=ref_fasta,
+        work_dir=work_dir,
+        tag="snps",
+    )
+    indel_vcf_for_shift = _normalize_local_vcf_with_bcftools(
+        input_vcf=indel_vcf,
+        output_vcf=indel_local_norm_vcf,
+        ref_fasta=ref_fasta,
+        work_dir=work_dir,
+        tag="indels",
+    )
+
+    snp_count = _normalize_single_vcf(snp_vcf_for_shift, snp_norm_vcf, new_chrom, region_start)
+    indel_count = _normalize_single_vcf(indel_vcf_for_shift, indel_norm_vcf, new_chrom, region_start)
     total = snp_count + indel_count
 
     if total == 0:
@@ -325,6 +344,92 @@ def normalize_vcf(gene_coords, work_dir):
 
     logger.info(f"Normalized SNP={snp_count}, INDEL={indel_count}, total={total}")
     logger.success(f"Created indexed VCF: {output_vcf_gz}")
+
+
+def _extract_contig_id(line: str) -> str | None:
+    match = re.search(r"##contig=<ID=([^,>]+)", line)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _ensure_contig_headers(input_vcf: Path, output_vcf: Path) -> Path:
+    """Ensure VCF header has ##contig entries for contigs used in records."""
+    if not input_vcf.exists():
+        return input_vcf
+
+    existing_contigs: set[str] = set()
+    observed_contigs: set[str] = set()
+    header_lines: list[str] = []
+    body_lines: list[str] = []
+    chrom_header: str | None = None
+
+    with open(input_vcf) as fin:
+        for line in fin:
+            if line.startswith("##"):
+                contig_id = _extract_contig_id(line)
+                if contig_id:
+                    existing_contigs.add(contig_id)
+                header_lines.append(line)
+            elif line.startswith("#CHROM"):
+                chrom_header = line
+            else:
+                if line.strip():
+                    observed_contigs.add(line.split("\t", 1)[0])
+                body_lines.append(line)
+
+    if chrom_header is None:
+        raise ValueError(f"Invalid VCF (missing #CHROM header): {input_vcf}")
+
+    missing_contigs = [contig for contig in observed_contigs if contig not in existing_contigs]
+    if not missing_contigs:
+        return input_vcf
+
+    with open(output_vcf, "w") as fout:
+        for line in header_lines:
+            fout.write(line)
+        for contig in sorted(missing_contigs):
+            fout.write(f"##contig=<ID={contig}>\n")
+        fout.write(chrom_header)
+        for line in body_lines:
+            fout.write(line)
+
+    logger.debug(f"Added missing contig headers for {input_vcf.name}: {sorted(missing_contigs)}")
+    return output_vcf
+
+
+def _vcf_has_records(vcf_path: Path) -> bool:
+    if not vcf_path.exists():
+        return False
+    with open(vcf_path) as handle:
+        for line in handle:
+            if line and not line.startswith("#"):
+                return True
+    return False
+
+
+def _normalize_local_vcf_with_bcftools(
+    input_vcf: Path,
+    output_vcf: Path,
+    ref_fasta: Path,
+    work_dir: Path,
+    tag: str,
+) -> Path:
+    """Run bcftools norm on local-coordinate VCF (same coordinate space as gene_seq.fasta)."""
+    if not input_vcf.exists():
+        return input_vcf
+    if not _vcf_has_records(input_vcf):
+        logger.debug(f"Skipping bcftools norm for empty VCF: {input_vcf}")
+        return input_vcf
+
+    prepared_vcf = _ensure_contig_headers(input_vcf, work_dir / f"gene_snps_local_norm_{tag}.headerfix.vcf")
+    t0 = time.perf_counter()
+    config.run_bio(
+        f"bcftools norm -f {ref_fasta} -m -any -c w -Ov -o {output_vcf} {prepared_vcf}"
+    )
+    dt = time.perf_counter() - t0
+    logger.info(f"bcftools norm ({tag}) completed in {dt:.3f}s")
+    return output_vcf
 
 
 def _normalize_single_vcf(
