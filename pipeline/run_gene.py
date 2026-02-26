@@ -271,7 +271,7 @@ def call_variants(work_dir, bam_path: Path, min_var_freq: float = 0.2):
 
 
 def normalize_vcf(gene_coords, work_dir):
-    """Convert local VCF coordinates to genomic coordinates."""
+    """Convert local SNP/INDEL VCF coordinates to genomic coordinates and merge them."""
     logger.info("Normalizing VCF coordinates")
 
     chr_acc = gene_coords["chr_acc"]
@@ -281,21 +281,72 @@ def normalize_vcf(gene_coords, work_dir):
 
     logger.debug(f"Converting {chr_acc} -> chr {new_chrom}, start={region_start}")
 
-    input_vcf = work_dir / "gene_snps.vcf"
+    snp_vcf = work_dir / "gene_snps.vcf"
+    indel_vcf = work_dir / "gene_indels.vcf"
+    snp_norm_vcf = work_dir / "gene_snps_normalized_snps.vcf"
+    indel_norm_vcf = work_dir / "gene_snps_normalized_indels.vcf"
     output_vcf = work_dir / "gene_snps_normalized.vcf"
     output_vcf_gz = work_dir / "gene_snps_normalized.vcf.gz"
+    output_vcf_tbi = Path(str(output_vcf_gz) + ".tbi")
+    merge_unsorted_gz = work_dir / "gene_snps_normalized_merged.unsorted.vcf.gz"
 
-    # Get the region chrom name from the VCF
+    snp_count = _normalize_single_vcf(snp_vcf, snp_norm_vcf, new_chrom, region_start)
+    indel_count = _normalize_single_vcf(indel_vcf, indel_norm_vcf, new_chrom, region_start)
+    total = snp_count + indel_count
+
+    if total == 0:
+        logger.warning("No variants found in SNP/INDEL VCF files")
+        return
+
+    normalized_gz_paths: list[Path] = []
+    if snp_count > 0:
+        snp_norm_gz = snp_norm_vcf.with_suffix(".vcf.gz")
+        config.run_bio(f"bgzip -c {snp_norm_vcf} > {snp_norm_gz}")
+        config.run_bio(f"tabix -p vcf {snp_norm_gz}")
+        normalized_gz_paths.append(snp_norm_gz)
+    if indel_count > 0:
+        indel_norm_gz = indel_norm_vcf.with_suffix(".vcf.gz")
+        config.run_bio(f"bgzip -c {indel_norm_vcf} > {indel_norm_gz}")
+        config.run_bio(f"tabix -p vcf {indel_norm_gz}")
+        normalized_gz_paths.append(indel_norm_gz)
+
+    if len(normalized_gz_paths) == 1:
+        src_gz = normalized_gz_paths[0]
+        src_tbi = Path(str(src_gz) + ".tbi")
+        shutil.copy(src_gz, output_vcf_gz)
+        shutil.copy(src_tbi, output_vcf_tbi)
+    else:
+        joined_inputs = " ".join(str(path) for path in normalized_gz_paths)
+        config.run_bio(f"bcftools concat -a -Oz -o {merge_unsorted_gz} {joined_inputs}")
+        config.run_bio(f"bcftools sort {merge_unsorted_gz} -Oz -o {output_vcf_gz}")
+        config.run_bio(f"tabix -f -p vcf {output_vcf_gz}")
+
+    config.run_bio(f"bcftools view -Ov -o {output_vcf} {output_vcf_gz}")
+
+    logger.info(f"Normalized SNP={snp_count}, INDEL={indel_count}, total={total}")
+    logger.success(f"Created indexed VCF: {output_vcf_gz}")
+
+
+def _normalize_single_vcf(
+    input_vcf: Path,
+    output_vcf: Path,
+    new_chrom: str,
+    region_start: int,
+) -> int:
+    """Normalize one local-coordinate VCF into genomic coordinates."""
+    if not input_vcf.exists():
+        return 0
+
     region_chrom = None
     with open(input_vcf) as f:
         for line in f:
-            if not line.startswith("#"):
-                region_chrom = line.split("\t")[0]
-                break
+            if line.startswith("#"):
+                continue
+            region_chrom = line.split("\t")[0]
+            break
 
     if region_chrom is None:
-        logger.warning("No variants found in VCF")
-        return
+        return 0
 
     variant_count = 0
     with open(input_vcf) as fin, open(output_vcf, "w") as fout:
@@ -314,12 +365,8 @@ def normalize_vcf(gene_coords, work_dir):
             fout.write("\t".join(parts) + "\n")
             variant_count += 1
 
-    logger.info(f"Normalized {variant_count} variants")
+    return variant_count
 
-    config.run_bio(f"bgzip -c {output_vcf} > {output_vcf_gz}")
-    config.run_bio(f"tabix -p vcf {output_vcf_gz}")
-
-    logger.success(f"Created indexed VCF: {output_vcf_gz}")
 
 
 def _refseq_accession_to_vcf_chrom(chr_acc: str) -> str:
