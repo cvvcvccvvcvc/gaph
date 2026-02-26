@@ -28,16 +28,14 @@ print(cfg.get("conda_env", "bio"))
 PY
 )"
 
-# Activate conda environment
+# Resolve conda-compatible runner.
+# Using `run -n` avoids accidental use of an active `.venv` python from parent shell.
 if command -v micromamba &>/dev/null; then
-    eval "$(micromamba shell hook --shell bash)"
-    micromamba activate "$CONDA_ENV"
+    CONDA_RUNNER="micromamba"
 elif command -v mamba &>/dev/null; then
-    eval "$(mamba shell hook --shell bash)"
-    mamba activate "$CONDA_ENV"
+    CONDA_RUNNER="mamba"
 elif command -v conda &>/dev/null; then
-    eval "$(conda shell.bash hook)"
-    conda activate "$CONDA_ENV"
+    CONDA_RUNNER="conda"
 else
     echo "ERROR: No conda/micromamba/mamba found" >&2
     exit 1
@@ -45,13 +43,4 @@ fi
 
 export PYTHONPATH="$SCRIPT_DIR/pipeline${PYTHONPATH:+:$PYTHONPATH}"
 
-if command -v python &>/dev/null; then
-    PIPELINE_PYTHON="python"
-elif command -v python3 &>/dev/null; then
-    PIPELINE_PYTHON="python3"
-else
-    echo "ERROR: No python/python3 found after activating conda env: $CONDA_ENV" >&2
-    exit 1
-fi
-
-"$PIPELINE_PYTHON" "$SCRIPT_DIR/pipeline/pipeline.py" "$CONFIG"
+"$CONDA_RUNNER" run -n "$CONDA_ENV" python "$SCRIPT_DIR/pipeline/pipeline.py" "$CONFIG"
