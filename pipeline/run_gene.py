@@ -277,8 +277,7 @@ def normalize_vcf(gene_coords, work_dir):
     chr_acc = gene_coords["chr_acc"]
     region_start = gene_coords["start"] + 1  # Convert to 1-based
 
-    match = re.search(r"NC_0+(\d+)\.", chr_acc)
-    new_chrom = match.group(1) if match else chr_acc
+    new_chrom = _refseq_accession_to_vcf_chrom(chr_acc)
 
     logger.debug(f"Converting {chr_acc} -> chr {new_chrom}, start={region_start}")
 
@@ -321,6 +320,22 @@ def normalize_vcf(gene_coords, work_dir):
     config.run_bio(f"tabix -p vcf {output_vcf_gz}")
 
     logger.success(f"Created indexed VCF: {output_vcf_gz}")
+
+
+def _refseq_accession_to_vcf_chrom(chr_acc: str) -> str:
+    """Map NCBI genomic accession to VCF chromosome naming used by gnomAD/ClinVar."""
+    match = re.search(r"NC_0+(\d+)\.", str(chr_acc))
+    if not match:
+        return chr_acc
+
+    chrom_num = int(match.group(1))
+    if chrom_num == 23:
+        return "X"
+    if chrom_num == 24:
+        return "Y"
+    if chrom_num in {12920, 1807}:
+        return "MT"
+    return str(chrom_num)
 
 
 def annotate_variants(work_dir, gnomad_vcf_gz=None):
