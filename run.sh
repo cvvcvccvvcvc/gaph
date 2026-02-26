@@ -43,4 +43,13 @@ fi
 
 export PYTHONPATH="$SCRIPT_DIR/pipeline${PYTHONPATH:+:$PYTHONPATH}"
 
-"$CONDA_RUNNER" run -n "$CONDA_ENV" python "$SCRIPT_DIR/pipeline/pipeline.py" "$CONFIG"
+if "$CONDA_RUNNER" run -n "$CONDA_ENV" python -V &>/dev/null; then
+    PIPELINE_PYTHON="python"
+elif "$CONDA_RUNNER" run -n "$CONDA_ENV" python3 -V &>/dev/null; then
+    PIPELINE_PYTHON="python3"
+else
+    echo "ERROR: Neither python nor python3 found in env: $CONDA_ENV" >&2
+    exit 1
+fi
+
+"$CONDA_RUNNER" run -n "$CONDA_ENV" "$PIPELINE_PYTHON" "$SCRIPT_DIR/pipeline/pipeline.py" "$CONFIG"
