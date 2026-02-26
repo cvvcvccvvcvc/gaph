@@ -385,6 +385,43 @@ def _refseq_accession_to_vcf_chrom(chr_acc: str) -> str:
     return str(chrom_num)
 
 
+def _read_vcf_info_ids(vcf_path: Path) -> set[str]:
+    info_ids: set[str] = set()
+    opener = gzip.open if str(vcf_path).endswith(".gz") else open
+    with opener(vcf_path, "rt") as handle:
+        for line in handle:
+            if line.startswith("##INFO=<ID="):
+                # Format: ##INFO=<ID=TAG,...
+                content = line[len("##INFO=<ID="):]
+                tag = content.split(",", 1)[0].split(">", 1)[0].strip()
+                if tag:
+                    info_ids.add(tag)
+                continue
+            if line.startswith("#CHROM"):
+                break
+    return info_ids
+
+
+def _build_annotate_columns(
+    annotation_vcf: Path,
+    *,
+    include_id: bool,
+    info_fields: list[str],
+    label: str,
+) -> str:
+    available_info = _read_vcf_info_ids(annotation_vcf)
+    selected_info = [f for f in info_fields if f in available_info]
+    missing = [f for f in info_fields if f not in available_info]
+    if missing:
+        logger.warning(f"{label} annotation fields not present and will be skipped: {missing}")
+
+    columns: list[str] = []
+    if include_id:
+        columns.append("ID")
+    columns.extend(f"INFO/{name}" for name in selected_info)
+    return ",".join(columns)
+
+
 def annotate_variants(work_dir, gnomad_vcf_gz=None):
     """Annotate pipeline variants with ClinVar and optionally gnomAD.
 
@@ -405,26 +442,72 @@ def annotate_variants(work_dir, gnomad_vcf_gz=None):
         logger.error(f"Normalized VCF not found: {sample_vcf}")
         return
 
+    clinvar_info_fields = [
+        "ALLELEID",
+        "RS",
+        "CLNSIG",
+        "CLNDN",
+        "CLNREVSTAT",
+        "CLNSIGCONF",
+        "CLNVC",
+        "CLNVCSO",
+        "CLNVI",
+        "GENEINFO",
+        "MC",
+    ]
+    gnomad_info_fields = [
+        "GNOMAD_VID",
+        "AF",
+        "MAF",
+        "AF_SOURCE",
+        "AF_EXOME",
+        "AF_GENOME",
+        "AF_JOINT",
+        "AN_JOINT",
+        "AC_JOINT",
+        "CSQ",
+        "HGVSC",
+        "HGVSP",
+    ]
+
+    clinvar_columns = _build_annotate_columns(
+        config.CLINVAR_VCF,
+        include_id=True,
+        info_fields=clinvar_info_fields,
+        label="ClinVar",
+    )
+
     if gnomad_vcf_gz:
+        gnomad_columns = _build_annotate_columns(
+            gnomad_vcf_gz,
+            include_id=False,
+            info_fields=gnomad_info_fields,
+            label="gnomAD",
+        )
+
         # bcftools annotate expects bgzipped+indexed input for a second annotation pass.
         clinvar_vcf_gz = work_dir / "gene_snps_clinvar_annotated.vcf.gz"
         config.run_bio(
             f"bcftools annotate -a {config.CLINVAR_VCF}"
-            f" -c INFO/CLNSIG,INFO/CLNDN,INFO/CLNREVSTAT"
+            f" -c {clinvar_columns}"
             f" -o {clinvar_vcf_gz} -O z"
             f" {sample_vcf}"
         )
         config.run_bio(f"tabix -p vcf {clinvar_vcf_gz}")
-        config.run_bio(
-            f"bcftools annotate -a {gnomad_vcf_gz}"
-            f" -c INFO/AF,INFO/MAF,INFO/CSQ"
-            f" -o {output_vcf} -O v"
-            f" {clinvar_vcf_gz}"
-        )
+        if gnomad_columns:
+            config.run_bio(
+                f"bcftools annotate -a {gnomad_vcf_gz}"
+                f" -c {gnomad_columns}"
+                f" -o {output_vcf} -O v"
+                f" {clinvar_vcf_gz}"
+            )
+        else:
+            logger.warning("gnomAD annotation columns list is empty; writing ClinVar-only annotated VCF")
+            config.run_bio(f"bcftools view -Ov -o {output_vcf} {clinvar_vcf_gz}")
     else:
         config.run_bio(
             f"bcftools annotate -a {config.CLINVAR_VCF}"
-            f" -c INFO/CLNSIG,INFO/CLNDN,INFO/CLNREVSTAT"
+            f" -c {clinvar_columns}"
             f" -o {output_vcf} -O v"
             f" {sample_vcf}"
         )
