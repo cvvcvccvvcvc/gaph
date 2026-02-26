@@ -265,15 +265,66 @@ def ncbi_to_ensembl(ncbi_gene_id: int) -> str | None:
     return ensembl_id
 
 
-def _select_af(variant: dict) -> float | None:
+def _to_float(value) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_int(value) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _joint_af_metrics(variant: dict) -> tuple[int | None, int | None, float | None]:
+    """Return (AN, AC, AF) from joint counts when available."""
+    joint = variant.get("joint")
+    if not isinstance(joint, dict):
+        return None, None, None
+
+    an = _to_int(joint.get("an"))
+    ac_raw = joint.get("ac")
+    if isinstance(ac_raw, list):
+        ac = _to_int(ac_raw[0]) if ac_raw else None
+    else:
+        ac = _to_int(ac_raw)
+
+    if an is None or an <= 0 or ac is None or ac < 0:
+        return an, ac, None
+    return an, ac, ac / an
+
+
+def _select_af_metrics(
+    variant: dict,
+) -> tuple[float | None, str | None, float | None, float | None, float | None, int | None, int | None]:
     """
-    Select allele frequency with priority: exome > genome.
+    Select AF with priority: joint (AC/AN) > exome > genome.
+
+    Returns:
+        (selected_af, af_source, af_exome, af_genome, af_joint, an_joint, ac_joint)
     """
-    if variant.get("exome") and variant["exome"].get("af") is not None:
-        return variant["exome"]["af"]
-    if variant.get("genome") and variant["genome"].get("af") is not None:
-        return variant["genome"]["af"]
-    return None
+    exome = variant.get("exome")
+    genome = variant.get("genome")
+    af_exome = _to_float(exome.get("af")) if isinstance(exome, dict) else None
+    af_genome = _to_float(genome.get("af")) if isinstance(genome, dict) else None
+
+    an_joint, ac_joint, af_joint = _joint_af_metrics(variant)
+    if af_joint is not None:
+        return af_joint, "joint", af_exome, af_genome, af_joint, an_joint, ac_joint
+    if af_exome is not None:
+        return af_exome, "exome", af_exome, af_genome, af_joint, an_joint, ac_joint
+    if af_genome is not None:
+        return af_genome, "genome", af_exome, af_genome, af_joint, an_joint, ac_joint
+    return None, None, af_exome, af_genome, af_joint, an_joint, ac_joint
 
 
 def _extract_query_error_messages(exc: TransportQueryError) -> list[str]:
@@ -384,9 +435,18 @@ def _write_vcf(variants: list, out_path: Path) -> None:
         vcf.write("##fileformat=VCFv4.2\n")
         vcf.write("##source=gnomAD_GraphQL_API\n")
         vcf.write("##reference=GRCh38\n")
+        vcf.write('##INFO=<ID=GNOMAD_VID,Number=1,Type=String,Description="gnomAD variant identifier from GraphQL variant_id">\n')
         vcf.write('##INFO=<ID=AF,Number=A,Type=Float,Description="Allele Frequency">\n')
-        vcf.write('##INFO=<ID=MAF,Number=1,Type=Float,Description="Minor Allele Frequency">\n')
+        vcf.write('##INFO=<ID=MAF,Number=1,Type=Float,Description="Minor Allele Frequency derived as min(AF, 1-AF)">\n')
+        vcf.write('##INFO=<ID=AF_SOURCE,Number=1,Type=String,Description="AF source priority used for AF (joint|exome|genome)">\n')
+        vcf.write('##INFO=<ID=AF_EXOME,Number=1,Type=Float,Description="Allele Frequency from exome dataset">\n')
+        vcf.write('##INFO=<ID=AF_GENOME,Number=1,Type=Float,Description="Allele Frequency from genome dataset">\n')
+        vcf.write('##INFO=<ID=AF_JOINT,Number=1,Type=Float,Description="Allele Frequency from joint counts AC/AN">\n')
+        vcf.write('##INFO=<ID=AN_JOINT,Number=1,Type=Integer,Description="Allele number from joint dataset">\n')
+        vcf.write('##INFO=<ID=AC_JOINT,Number=1,Type=Integer,Description="Allele count from joint dataset">\n')
         vcf.write('##INFO=<ID=CSQ,Number=.,Type=String,Description="Consequence">\n')
+        vcf.write('##INFO=<ID=HGVSC,Number=1,Type=String,Description="HGVSc notation from gnomAD GraphQL">\n')
+        vcf.write('##INFO=<ID=HGVSP,Number=1,Type=String,Description="HGVSp notation from gnomAD GraphQL">\n')
         vcf.write("#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO\n")
 
         for v in variants:
@@ -394,18 +454,36 @@ def _write_vcf(variants: list, out_path: Path) -> None:
             pos = v["pos"]
             ref = v["ref"]
             alt = v["alt"]
-            vid = v["variant_id"]
+            vid = str(v.get("variant_id", "."))
 
-            af = _select_af(v)
-            maf = af  # For common variants, AF ~ MAF
+            af, af_source, af_exome, af_genome, af_joint, an_joint, ac_joint = _select_af_metrics(v)
+            maf = min(af, 1.0 - af) if af is not None else None
 
             info_fields = []
+            if vid and vid != ".":
+                info_fields.append(f"GNOMAD_VID={vid}")
+            if af_source:
+                info_fields.append(f"AF_SOURCE={af_source}")
             if af is not None:
                 info_fields.append(f"AF={af:.6g}")
             if maf is not None:
                 info_fields.append(f"MAF={maf:.6g}")
+            if af_exome is not None:
+                info_fields.append(f"AF_EXOME={af_exome:.6g}")
+            if af_genome is not None:
+                info_fields.append(f"AF_GENOME={af_genome:.6g}")
+            if af_joint is not None:
+                info_fields.append(f"AF_JOINT={af_joint:.6g}")
+            if an_joint is not None:
+                info_fields.append(f"AN_JOINT={an_joint}")
+            if ac_joint is not None:
+                info_fields.append(f"AC_JOINT={ac_joint}")
             if v.get("consequence"):
                 info_fields.append(f"CSQ={v['consequence']}")
+            if v.get("hgvsc"):
+                info_fields.append(f"HGVSC={v['hgvsc']}")
+            if v.get("hgvsp"):
+                info_fields.append(f"HGVSP={v['hgvsp']}")
 
             info = ";".join(info_fields) if info_fields else "."
 
