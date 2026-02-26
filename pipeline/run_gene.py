@@ -569,7 +569,7 @@ def run_gene(gene_id, work_dir, cfg):
         normalize_vcf(gene_coords, work_dir)
 
     # Step 8: Annotate variants with ClinVar and gnomAD
-    gnomad_vcf_full = download_gnomad_for_gene(gene_id)
+    gnomad_vcf_full = download_gnomad_for_gene(gene_id, gene_coords=gene_coords)
     gnomad_gz = prepare_gnomad_vcf(gnomad_vcf_full, work_dir) if gnomad_vcf_full else None
     annotate_variants(work_dir, gnomad_gz)
 

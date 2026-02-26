@@ -23,6 +23,8 @@ import config
 GNOMAD_API_URL = "https://gnomad.broadinstitute.org/api"
 GNOMAD_MAX_RETRIES = 3
 GNOMAD_RETRY_DELAY_SEC = 20
+GNOMAD_REGION_MIN_WINDOW_BP = 500
+GNOMAD_RATE_LIMIT_SLEEP_SEC = 65
 GNOMAD_HEADERS = {
     # gnomAD currently rejects default aiohttp client signatures with 403.
     "Accept": "application/json",
@@ -36,11 +38,41 @@ GNOMAD_HEADERS = {
     ),
 }
 
-GNOMAD_QUERY = gql("""
+GNOMAD_GENE_QUERY = gql("""
 query VariantsInGene($gene_id: String!) {
   gene(gene_id: $gene_id, reference_genome: GRCh38) {
     gene_id
     symbol
+    variants(dataset: gnomad_r4) {
+      variant_id
+      chrom
+      pos
+      ref
+      alt
+      consequence
+      hgvsc
+      hgvsp
+
+      exome {
+        af
+      }
+
+      genome {
+        af
+      }
+
+      joint {
+        an
+        ac
+      }
+    }
+  }
+}
+""")
+
+GNOMAD_REGION_QUERY = gql("""
+query VariantsInRegion($chrom: String!, $start: Int!, $stop: Int!) {
+  region(chrom: $chrom, start: $start, stop: $stop, reference_genome: GRCh38) {
     variants(dataset: gnomad_r4) {
       variant_id
       chrom
@@ -276,6 +308,75 @@ def _format_exception(e: Exception) -> str:
     return f"{type(e).__name__}: {repr(e)}"
 
 
+def _cached_vcf_has_variants(path: Path) -> bool:
+    try:
+        with open(path) as handle:
+            return any(not line.startswith("#") for line in handle)
+    except Exception:
+        return False
+
+
+def _refseq_accession_to_gnomad_chrom(chr_acc: str | None) -> str | None:
+    if not chr_acc:
+        return None
+    c = str(chr_acc).strip()
+    if c.startswith("chr"):
+        c = c[3:]
+    if c in {"X", "Y", "MT", "M"}:
+        return "MT" if c == "M" else c
+    if c.isdigit():
+        value = int(c)
+        if value == 23:
+            return "X"
+        if value == 24:
+            return "Y"
+        return str(value)
+
+    import re
+
+    match = re.search(r"NC_0+(\d+)\.", c)
+    if not match:
+        return None
+    chrom_num = int(match.group(1))
+    if chrom_num == 23:
+        return "X"
+    if chrom_num == 24:
+        return "Y"
+    if chrom_num in {12920, 1807}:
+        return "MT"
+    return str(chrom_num)
+
+
+def _is_rate_limit_error(messages: list[str]) -> bool:
+    joined = " | ".join(m.lower() for m in messages)
+    return "rate limit" in joined
+
+
+def _is_region_split_error(messages: list[str]) -> bool:
+    joined = " | ".join(m.lower() for m in messages)
+    return (
+        "select a smaller region" in joined
+        or "too many variants" in joined
+        or "temporarily unavailable" in joined
+    )
+
+
+def _variant_key(v: dict[str, Any]) -> tuple[str, int, str, str]:
+    return (str(v.get("chrom")), int(v.get("pos")), str(v.get("ref")), str(v.get("alt")))
+
+
+def _dedupe_variants(variants: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen: set[tuple[str, int, str, str]] = set()
+    out: list[dict[str, Any]] = []
+    for v in variants:
+        key = _variant_key(v)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(v)
+    return out
+
+
 def _write_vcf(variants: list, out_path: Path) -> None:
     """Write variants to VCF format."""
     with open(out_path, "w") as vcf:
@@ -311,6 +412,88 @@ def _write_vcf(variants: list, out_path: Path) -> None:
             vcf.write(f"{chrom}\t{pos}\t{vid}\t{ref}\t{alt}\t.\tPASS\t{info}\n")
 
 
+async def _fetch_region_variants_recursive(
+    client: Client,
+    chrom: str,
+    start: int,
+    stop: int,
+    *,
+    rate_limit_retries: int = 3,
+) -> list[dict[str, Any]]:
+    try:
+        data = await client.execute_async(
+            GNOMAD_REGION_QUERY,
+            variable_values={"chrom": chrom, "start": int(start), "stop": int(stop)},
+        )
+    except TransportQueryError as e:
+        messages = _extract_query_error_messages(e)
+        if _is_rate_limit_error(messages) and rate_limit_retries > 0:
+            logger.warning(
+                "gnomAD rate limit for region {}:{}-{}. Retrying in {}s ({} retries left)",
+                chrom,
+                start,
+                stop,
+                GNOMAD_RATE_LIMIT_SLEEP_SEC,
+                rate_limit_retries,
+            )
+            await asyncio.sleep(GNOMAD_RATE_LIMIT_SLEEP_SEC)
+            return await _fetch_region_variants_recursive(
+                client,
+                chrom,
+                start,
+                stop,
+                rate_limit_retries=rate_limit_retries - 1,
+            )
+
+        span = stop - start + 1
+        if _is_region_split_error(messages) and span > GNOMAD_REGION_MIN_WINDOW_BP and start < stop:
+            mid = (start + stop) // 2
+            logger.info(
+                "Splitting gnomAD region {}:{}-{} due to API constraint ({}).",
+                chrom,
+                start,
+                stop,
+                "; ".join(messages) if messages else "no details",
+            )
+            left = await _fetch_region_variants_recursive(client, chrom, start, mid)
+            right = await _fetch_region_variants_recursive(client, chrom, mid + 1, stop)
+            return left + right
+
+        details = "; ".join(messages) if messages else _format_exception(e)
+        raise RuntimeError(f"gnomAD region query error for {chrom}:{start}-{stop}: {details}") from e
+
+    region = data.get("region")
+    if not region:
+        return []
+    variants = region.get("variants", [])
+    if not isinstance(variants, list):
+        return []
+    return variants
+
+
+async def fetch_gnomad_variants_in_region(
+    chrom: str,
+    start: int,
+    stop: int,
+    output_path_full: Path,
+) -> int:
+    """Download gnomAD variants for a genomic region via GraphQL API."""
+    logger.info(f"Fetching gnomAD variants for region {chrom}:{start}-{stop}")
+
+    transport = AIOHTTPTransport(url=GNOMAD_API_URL, headers=GNOMAD_HEADERS)
+    client = Client(transport=transport, fetch_schema_from_transport=False)
+
+    try:
+        variants = await _fetch_region_variants_recursive(client, chrom, int(start), int(stop))
+        variants = _dedupe_variants(variants)
+        variants.sort(key=lambda v: _variant_key(v))
+        _write_vcf(variants, output_path_full)
+        logger.success(f"Saved gnomAD variants -> {output_path_full} ({len(variants)} total)")
+        return len(variants)
+    finally:
+        await transport.close()
+
+
 async def fetch_gnomad_variants(
     ensembl_id: str,
     output_path_full: Path,
@@ -333,7 +516,7 @@ async def fetch_gnomad_variants(
 
     try:
         data = await client.execute_async(
-            GNOMAD_QUERY,
+            GNOMAD_GENE_QUERY,
             variable_values={"gene_id": ensembl_id}
         )
 
@@ -372,31 +555,92 @@ async def fetch_gnomad_variants(
         await transport.close()
 
 
-def download_gnomad_for_gene(ncbi_gene_id: int) -> Path | None:
-    """
-    Download gnomAD variants for a gene (sync wrapper).
-    Uses cache if available.
+def _run_async(coro):
+    """Run async coroutine in script and already-running-loop contexts."""
+    try:
+        _ = asyncio.get_running_loop()
+        import concurrent.futures
 
-    Args:
-        ncbi_gene_id: NCBI Gene ID
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            future = executor.submit(asyncio.run, coro)
+            return future.result()
+    except RuntimeError:
+        return asyncio.run(coro)
 
-    Returns:
-        Full gnomAD VCF path, or None if download failed
-    """
+
+def _download_gnomad_for_gene_via_region(ncbi_gene_id: int, gene_coords: dict[str, Any]) -> Path | None:
+    chrom = _refseq_accession_to_gnomad_chrom(gene_coords.get("chr_acc"))
+    if not chrom:
+        logger.warning(f"Cannot derive gnomAD chromosome from coords for gene {ncbi_gene_id}: {gene_coords}")
+        return None
+
+    region_start = int(min(gene_coords["start"], gene_coords["end"])) + 1
+    region_stop = int(max(gene_coords["start"], gene_coords["end"])) + 1
+    output_vcf_full = (
+        config.GNOMAD_CACHE_DIR / f"ncbi_{ncbi_gene_id}_{chrom}_{region_start}_{region_stop}_full.vcf"
+    )
+    use_cache = _cache_enabled("gnomad")
+
+    if use_cache and output_vcf_full.exists() and _cached_vcf_has_variants(output_vcf_full):
+        logger.info(f"Using cached gnomAD region data: {output_vcf_full}")
+        return output_vcf_full
+    if use_cache and output_vcf_full.exists():
+        logger.warning(f"Ignoring empty cached gnomAD region VCF: {output_vcf_full}")
+    if not use_cache and output_vcf_full.exists():
+        output_vcf_full.unlink(missing_ok=True)
+
+    last_error: str | None = None
+    for attempt in range(1, GNOMAD_MAX_RETRIES + 1):
+        try:
+            full_count = _run_async(
+                fetch_gnomad_variants_in_region(chrom, region_start, region_stop, output_vcf_full)
+            )
+            if full_count == 0:
+                logger.warning(
+                    "gnomAD region {}:{}-{} returned 0 variants for gene {}",
+                    chrom,
+                    region_start,
+                    region_stop,
+                    ncbi_gene_id,
+                )
+                output_vcf_full.unlink(missing_ok=True)
+                return None
+            return output_vcf_full
+        except Exception as e:
+            last_error = _format_exception(e)
+            if attempt < GNOMAD_MAX_RETRIES:
+                logger.warning(
+                    "gnomAD region fetch attempt {}/{} failed for gene {} ({}:{}-{}): {}. Retrying in {}s",
+                    attempt,
+                    GNOMAD_MAX_RETRIES,
+                    ncbi_gene_id,
+                    chrom,
+                    region_start,
+                    region_stop,
+                    last_error,
+                    GNOMAD_RETRY_DELAY_SEC,
+                )
+                time.sleep(GNOMAD_RETRY_DELAY_SEC)
+            else:
+                logger.warning(
+                    "gnomAD region fetch failed for gene {} after {} attempts ({}:{}-{}): {}",
+                    ncbi_gene_id,
+                    GNOMAD_MAX_RETRIES,
+                    chrom,
+                    region_start,
+                    region_stop,
+                    last_error,
+                )
+    return None
+
+
+def _download_gnomad_for_gene_via_gene_endpoint(ncbi_gene_id: int) -> Path | None:
     ensembl_candidates = ncbi_to_ensembl_candidates(ncbi_gene_id)
     if not ensembl_candidates:
         logger.warning(f"Cannot download gnomAD: no Ensembl ID for gene {ncbi_gene_id}")
         return None
 
     use_cache = _cache_enabled("gnomad")
-    config.GNOMAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-
-    def _cached_vcf_has_variants(path: Path) -> bool:
-        try:
-            with open(path) as handle:
-                return any(not line.startswith("#") for line in handle)
-        except Exception:
-            return False
 
     # Check cache for each candidate in order.
     if use_cache:
@@ -409,23 +653,6 @@ def download_gnomad_for_gene(ncbi_gene_id: int) -> Path | None:
                 return output_vcf_full
             logger.warning(f"Ignoring empty cached gnomAD VCF: {output_vcf_full}")
 
-    def _run_fetch_once(ensembl_id: str, output_vcf_full: Path) -> tuple[int, bool]:
-        """Run async fetch in both script and already-running-loop contexts."""
-        try:
-            # If we're already in a running loop (e.g. notebook), run in thread.
-            _ = asyncio.get_running_loop()
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor() as executor:
-                future = executor.submit(
-                    asyncio.run,
-                    fetch_gnomad_variants(ensembl_id, output_vcf_full),
-                )
-                return future.result()
-        except RuntimeError:
-            # No running loop - standard script context.
-            return asyncio.run(fetch_gnomad_variants(ensembl_id, output_vcf_full))
-
     failures: list[str] = []
     for ensembl_id in ensembl_candidates:
         output_vcf_full = config.GNOMAD_CACHE_DIR / f"{ensembl_id}_full.vcf"
@@ -436,7 +663,7 @@ def download_gnomad_for_gene(ncbi_gene_id: int) -> Path | None:
 
         for attempt in range(1, GNOMAD_MAX_RETRIES + 1):
             try:
-                full_count, gene_not_found = _run_fetch_once(ensembl_id, output_vcf_full)
+                full_count, gene_not_found = _run_async(fetch_gnomad_variants(ensembl_id, output_vcf_full))
                 if gene_not_found:
                     logger.info(f"gnomAD has no data for candidate {ensembl_id}, trying next ID")
                     break
@@ -482,6 +709,28 @@ def download_gnomad_for_gene(ncbi_gene_id: int) -> Path | None:
             ", ".join(ensembl_candidates),
         )
     return None
+
+
+def download_gnomad_for_gene(ncbi_gene_id: int, gene_coords: dict[str, Any] | None = None) -> Path | None:
+    """
+    Download gnomAD variants for a gene (sync wrapper).
+
+    Strategy:
+    1. Preferred: fetch by genomic region from gene_coords (broader and more complete).
+    2. Fallback: fetch by Ensembl gene endpoint.
+    """
+    config.GNOMAD_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+
+    if gene_coords:
+        region_vcf = _download_gnomad_for_gene_via_region(ncbi_gene_id, gene_coords)
+        if region_vcf:
+            return region_vcf
+        logger.warning(
+            "Falling back to gnomAD gene endpoint for NCBI gene {} after region fetch failure/empty result",
+            ncbi_gene_id,
+        )
+
+    return _download_gnomad_for_gene_via_gene_endpoint(ncbi_gene_id)
 
 
 def prepare_gnomad_vcf(vcf_path: Path, output_dir: Path, suffix: str = "") -> Path | None:
