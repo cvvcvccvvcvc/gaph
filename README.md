@@ -40,8 +40,16 @@ Example:
   "gene_ids": [672],
   "hitlist_size": 5000,
   "blast_expect": 10.0,
-  "pseudo_read_phred": 30,
-  "min_var_freq": 0.2,
+  "read_generation": {
+    "pseudo_read_phred": 30,
+    "read_len": 75,
+    "step": 35
+  },
+  "variant_calling": {
+    "min_var_freq": 0.2,
+    "min_coverage": 8,
+    "min_reads2": 2
+  },
   "env_file": ".env",
   "data_dir": "data",
   "runs_dir": "runs",
@@ -51,11 +59,12 @@ Example:
   "keep_intermediate_files": false,
   "bam_filtering": {
     "enabled": true,
+    "wrong_strand": true,
+    "lis": true,
+    "overlap": true,
     "min_mapped_pct_of_generated": 10,
     "max_pct_filtered": 50,
-    "min_kept_pct_of_reference": 10,
-    "read_len": 75,
-    "step": 35
+    "min_kept_pct_of_reference": 10
   }
 }
 ```
@@ -76,11 +85,13 @@ Example:
 ### `bam_filtering` rules
 
 - `enabled`: boolean.
+- `wrong_strand`: boolean (enable/disable dominant-strand filtering stage).
+- `lis`: boolean (enable/disable LIS/LDS ordering stage).
+- `overlap`: boolean (enable/disable overlap dedup stage).
 - If `enabled=true`, these are required and must be in `[0, 100]`:
   - `min_mapped_pct_of_generated`
   - `max_pct_filtered`
   - `min_kept_pct_of_reference`
-- `read_len` and `step` are optional positive integers (default `75` and `35`).
 - If `min_mapped_pct_of_generated` is enabled and generated pseudo-read counts cannot be computed for homologues, gene processing fails fast.
 
 ### BLAST parameters
@@ -88,10 +99,17 @@ Example:
 - `hitlist_size`: max number of BLAST hits to request.
 - `blast_expect`: BLAST E-value cutoff (passed to `qblast(..., expect=...)`).
 
+### Read generation parameters
+
+- `read_generation.pseudo_read_phred`: fixed PHRED assigned to generated pseudo-reads.
+- `read_generation.read_len`: pseudo-read length.
+- `read_generation.step`: sliding-window step for pseudo-read generation.
+
 ### Variant calling parameters
 
-- `pseudo_read_phred`: fixed PHRED assigned to generated pseudo-reads.
-- `min_var_freq`: passed to VarScan as `--min-var-freq`.
+- `variant_calling.min_var_freq`: passed to VarScan as `--min-var-freq`.
+- `variant_calling.min_coverage`: passed to VarScan as `--min-coverage`.
+- `variant_calling.min_reads2`: passed to VarScan as `--min-reads2`.
 
 ## Outputs
 

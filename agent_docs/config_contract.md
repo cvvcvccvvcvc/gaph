@@ -5,7 +5,9 @@ Use this when changing `config.json` schema or behavior.
 ## Where Config Is Validated
 
 Validation happens in `pipeline/pipeline.py` before processing genes:
-- numeric core fields: `pipeline/pipeline.py:198` to `pipeline/pipeline.py:209`
+- numeric core fields: hitlist/blast parameters in `pipeline/pipeline.py`
+- `read_generation` block: `pipeline/pipeline.py`
+- `variant_calling` block: `pipeline/pipeline.py`
 - resume run path: `pipeline/pipeline.py:197`, `pipeline/pipeline.py:296`
 - BAM filtering block: `pipeline/pipeline.py:86`
 - cache block: `pipeline/pipeline.py:135`
@@ -33,7 +35,9 @@ Critical details:
 ## BAM Filtering Rules
 
 - `bam_filtering` block is required by current validator (`pipeline/pipeline.py:88`)
+- per-stage toggles: `wrong_strand`, `lis`, `overlap` (booleans)
 - required thresholds when enabled: `pipeline/pipeline.py:108`
+- pseudo-read geometry (`read_len`, `step`) now lives in `read_generation` and is passed into filtering runtime from `pipeline/run_gene.py`
 - fail-fast on missing generated counts is enforced in filtering module: `pipeline/bam_filtering.py:506`
 
 ## Cache Rules
