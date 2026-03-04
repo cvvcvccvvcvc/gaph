@@ -81,12 +81,6 @@ def _validate_phred_field(name: str, value) -> int:
     return value
 
 
-def _validate_positive_int(name: str, value) -> int:
-    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
-        raise TypeError(f"bam_filtering.{name} must be a positive integer, got: {value!r}")
-    return value
-
-
 def validate_bam_filtering_cfg(cfg: dict) -> dict:
     """Validate and normalize the bam_filtering config section."""
     if "bam_filtering" not in cfg:
@@ -103,10 +97,17 @@ def validate_bam_filtering_cfg(cfg: dict) -> dict:
     if not isinstance(enabled, bool):
         raise TypeError(f"bam_filtering.enabled must be boolean, got: {enabled!r}")
 
+    def _read_bool(name: str, default: bool = True) -> bool:
+        value = raw.get(name, default)
+        if not isinstance(value, bool):
+            raise TypeError(f"bam_filtering.{name} must be boolean, got: {value!r}")
+        return value
+
     validated = {
         "enabled": enabled,
-        "read_len": _validate_positive_int("read_len", raw.get("read_len", 75)),
-        "step": _validate_positive_int("step", raw.get("step", 35)),
+        "wrong_strand": _read_bool("wrong_strand", True),
+        "lis": _read_bool("lis", True),
+        "overlap": _read_bool("overlap", True),
     }
 
     required_thresholds = [
@@ -134,6 +135,54 @@ def validate_bam_filtering_cfg(cfg: dict) -> dict:
             validated[key] = None
 
     return validated
+
+
+def validate_read_generation_cfg(cfg: dict) -> dict:
+    """Validate and normalize read generation parameters."""
+    raw = cfg.get("read_generation", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TypeError(f"'read_generation' must be an object, got: {type(raw).__name__}")
+
+    return {
+        "pseudo_read_phred": _validate_phred_field(
+            "read_generation.pseudo_read_phred",
+            raw.get("pseudo_read_phred", 30),
+        ),
+        "read_len": _validate_positive_int_field(
+            "read_generation.read_len",
+            raw.get("read_len", 75),
+        ),
+        "step": _validate_positive_int_field(
+            "read_generation.step",
+            raw.get("step", 35),
+        ),
+    }
+
+
+def validate_variant_calling_cfg(cfg: dict) -> dict:
+    """Validate and normalize variant calling parameters."""
+    raw = cfg.get("variant_calling", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TypeError(f"'variant_calling' must be an object, got: {type(raw).__name__}")
+
+    return {
+        "min_var_freq": _validate_fraction_field(
+            "variant_calling.min_var_freq",
+            raw.get("min_var_freq", 0.2),
+        ),
+        "min_coverage": _validate_positive_int_field(
+            "variant_calling.min_coverage",
+            raw.get("min_coverage", 8),
+        ),
+        "min_reads2": _validate_positive_int_field(
+            "variant_calling.min_reads2",
+            raw.get("min_reads2", 2),
+        ),
+    }
 
 
 def validate_cache_cfg(cfg: dict) -> dict:
@@ -270,12 +319,8 @@ def main():
     cfg["blast_expect"] = _validate_positive_number_field(
         "blast_expect", cfg.get("blast_expect", 10.0)
     )
-    cfg["pseudo_read_phred"] = _validate_phred_field(
-        "pseudo_read_phred", cfg.get("pseudo_read_phred", 30)
-    )
-    cfg["min_var_freq"] = _validate_fraction_field(
-        "min_var_freq", cfg.get("min_var_freq", 0.2)
-    )
+    cfg["read_generation"] = validate_read_generation_cfg(cfg)
+    cfg["variant_calling"] = validate_variant_calling_cfg(cfg)
     cfg["resume_run_dir"] = _validate_resume_run_dir_cfg(cfg)
     cfg["bam_filtering"] = validate_bam_filtering_cfg(cfg)
     cfg["cache"] = validate_cache_cfg(cfg)
@@ -332,8 +377,8 @@ def main():
             "gene_ids": cfg["gene_ids"],
             "hitlist_size": cfg["hitlist_size"],
             "blast_expect": cfg["blast_expect"],
-            "pseudo_read_phred": cfg["pseudo_read_phred"],
-            "min_var_freq": cfg["min_var_freq"],
+            "read_generation": cfg["read_generation"],
+            "variant_calling": cfg["variant_calling"],
             "resume_run_dir": str(resume_run_dir) if resume_run_dir else None,
             "bam_filtering": cfg["bam_filtering"],
             "cache": cfg["cache"],
@@ -366,11 +411,8 @@ def main():
         )
     logger.info(f"Gene IDs: {cfg['gene_ids']}")
     logger.info(f"BLAST parameters: hitlist_size={cfg['hitlist_size']}, expect={cfg['blast_expect']}")
-    logger.info(
-        "Variant parameters: pseudo_read_phred={}, min_var_freq={}",
-        cfg["pseudo_read_phred"],
-        cfg["min_var_freq"],
-    )
+    logger.info(f"Read generation config: {cfg['read_generation']}")
+    logger.info(f"Variant calling config: {cfg['variant_calling']}")
     logger.info(f"BAM filtering config: {cfg['bam_filtering']}")
     logger.info(f"Cache config: {cfg['cache']}")
 
