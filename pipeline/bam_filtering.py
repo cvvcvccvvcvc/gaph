@@ -190,6 +190,9 @@ def _backbone_indices(reads: List[Dict[str, Any]], dominant_strand: str) -> Set[
 def _filter_homologue_reads(
     reads: List[Dict[str, Any]],
     dominant_strand: str,
+    apply_wrong_strand: bool = True,
+    apply_lis: bool = True,
+    apply_overlap: bool = True,
 ) -> Tuple[Set[Tuple[Any, ...]], Dict[str, Any]]:
     """Apply dominant strand + LIS/LDS + overlap filtering to one homologue."""
     if not reads:
@@ -202,24 +205,34 @@ def _filter_homologue_reads(
     reads = _assign_observed_numbers(reads)
     reads = _assign_aligned_read_numbers(reads)
 
-    if dominant_strand == "forward":
-        reads_after_strand = [r for r in reads if not r["is_reverse"]]
-    else:
-        reads_after_strand = [r for r in reads if r["is_reverse"]]
-
-    keep_idx = _backbone_indices(reads_after_strand, dominant_strand)
-    reads_after_order = [r for i, r in enumerate(reads_after_strand) if i in keep_idx]
-
-    position_groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
-    for read in reads_after_order:
-        position_groups[read["alignment_pos"]].append(read)
-
-    reads_final: List[Dict[str, Any]] = []
-    for reads_at_pos in position_groups.values():
-        if len(reads_at_pos) == 1:
-            reads_final.append(reads_at_pos[0])
+    if apply_wrong_strand:
+        if dominant_strand == "forward":
+            reads_after_strand = [r for r in reads if not r["is_reverse"]]
         else:
-            reads_final.append(min(reads_at_pos, key=lambda r: r["actual_read_num"]))
+            reads_after_strand = [r for r in reads if r["is_reverse"]]
+    else:
+        reads_after_strand = list(reads)
+
+    if apply_lis:
+        keep_idx = _backbone_indices(reads_after_strand, dominant_strand)
+        reads_after_order = [r for i, r in enumerate(reads_after_strand) if i in keep_idx]
+    else:
+        keep_idx = set(range(len(reads_after_strand)))
+        reads_after_order = list(reads_after_strand)
+
+    if apply_overlap:
+        position_groups: Dict[int, List[Dict[str, Any]]] = defaultdict(list)
+        for read in reads_after_order:
+            position_groups[read["alignment_pos"]].append(read)
+
+        reads_final: List[Dict[str, Any]] = []
+        for reads_at_pos in position_groups.values():
+            if len(reads_at_pos) == 1:
+                reads_final.append(reads_at_pos[0])
+            else:
+                reads_final.append(min(reads_at_pos, key=lambda r: r["actual_read_num"]))
+    else:
+        reads_final = list(reads_after_order)
 
     keep_keys = {r["read_key"] for r in reads_final}
 
@@ -228,7 +241,10 @@ def _filter_homologue_reads(
         "forward_initial": forward_initial,
         "reverse_initial": reverse_initial,
         "dominant_strand": dominant_strand,
-        "order_method": "lis",
+        "order_method": "lis" if apply_lis else "disabled",
+        "wrong_strand_enabled": apply_wrong_strand,
+        "lis_enabled": apply_lis,
+        "overlap_enabled": apply_overlap,
         "after_strand_filter": len(reads_after_strand),
         "after_order_filter": len(reads_after_order),
         "after_overlap_filter": len(reads_final),
@@ -353,6 +369,8 @@ def load_reference_pseudoreads(
 def filter_bam_for_gene(
     work_dir: Path,
     filtering_cfg: Dict[str, Any],
+    read_len: int = 75,
+    step: int = 35,
     verbose: bool = False,
 ) -> FilterResult:
     """
@@ -374,16 +392,21 @@ def filter_bam_for_gene(
     if not input_bam.exists():
         raise FileNotFoundError(f"Input BAM not found: {input_bam}")
 
-    read_len = int(filtering_cfg.get("read_len", 75))
-    step = int(filtering_cfg.get("step", 35))
+    wrong_strand = bool(filtering_cfg.get("wrong_strand", True))
+    lis = bool(filtering_cfg.get("lis", True))
+    overlap = bool(filtering_cfg.get("overlap", True))
     min_mapped_pct = filtering_cfg.get("min_mapped_pct_of_generated")
     max_pct_filtered = filtering_cfg.get("max_pct_filtered")
     min_kept_pct_of_reference = filtering_cfg.get("min_kept_pct_of_reference")
 
     logger.info(
-        "BAM filtering started: input={}, min_mapped_pct_of_generated={}, "
-        "max_pct_filtered={}, min_kept_pct_of_reference={}, read_len={}, step={}",
+        "BAM filtering started: input={}, wrong_strand={}, lis={}, overlap={}, "
+        "min_mapped_pct_of_generated={}, max_pct_filtered={}, min_kept_pct_of_reference={}, "
+        "read_len={}, step={}",
         input_bam,
+        wrong_strand,
+        lis,
+        overlap,
         min_mapped_pct,
         max_pct_filtered,
         min_kept_pct_of_reference,
@@ -424,7 +447,13 @@ def filter_bam_for_gene(
     for homologue_id in sorted(homologue_stats.keys()):
         reads = reads_by_homologue.get(homologue_id, [])
         dominant_strand = homologue_stats[homologue_id]["dominant_strand"]
-        keep_keys, stats = _filter_homologue_reads(reads, dominant_strand)
+        keep_keys, stats = _filter_homologue_reads(
+            reads,
+            dominant_strand,
+            apply_wrong_strand=wrong_strand,
+            apply_lis=lis,
+            apply_overlap=overlap,
+        )
 
         generated = generated_counts.get(homologue_id)
         mapped_pct = None
@@ -538,9 +567,12 @@ def filter_bam_for_gene(
         "input_bam": str(input_bam),
         "output_bam": str(output_bam),
         "per_homologue_stats_json": str(per_homologue_stats_json),
-        "order_method": "lis",
+        "order_method": "lis" if lis else "disabled",
         "pseudo_read_len": read_len,
         "pseudo_read_step": step,
+        "wrong_strand": wrong_strand,
+        "lis": lis,
+        "overlap": overlap,
         "min_mapped_pct_of_generated": min_mapped_pct,
         "max_pct_filtered": max_pct_filtered,
         "min_kept_pct_of_reference": min_kept_pct_of_reference,

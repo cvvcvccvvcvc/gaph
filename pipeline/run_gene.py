@@ -196,13 +196,17 @@ def download_gene_seq(gene_id, work_dir, cfg):
     return coords_out
 
 
-def generate_pseudoreads(input_fastq, work_dir, phred: int = 30):
+def generate_pseudoreads(
+    input_fastq,
+    work_dir,
+    read_len: int = 75,
+    step: int = 35,
+    phred: int = 30,
+):
     """Create sliding window pseudoreads from ortholog sequences."""
     output_fastq = work_dir / "pseudo_reads.fastq"
-    READ_LEN = 75
-    STEP = 35
 
-    logger.info(f"Generating pseudoreads (read_len={READ_LEN}, step={STEP}, phred={phred})")
+    logger.info(f"Generating pseudoreads (read_len={read_len}, step={step}, phred={phred})")
 
     phred_char = chr(phred + 33)
     total_reads = 0
@@ -213,10 +217,10 @@ def generate_pseudoreads(input_fastq, work_dir, phred: int = 30):
             n = len(seq)
             read_index = 1
 
-            for start in range(0, n - READ_LEN + 1, STEP):
-                read_seq = seq[start : start + READ_LEN]
+            for start in range(0, n - read_len + 1, step):
+                read_seq = seq[start : start + read_len]
                 qual = phred_char * len(read_seq)
-                header = f"@{record.id}_pseudo_{read_index}_{start+1}-{start+READ_LEN}"
+                header = f"@{record.id}_pseudo_{read_index}_{start+1}-{start+read_len}"
 
                 out.write(f"{header}\n{read_seq}\n+\n{qual}\n")
                 read_index += 1
@@ -244,7 +248,13 @@ def align_pseudoreads(work_dir):
     logger.success(f"Alignment complete -> {sorted_bam}")
 
 
-def call_variants(work_dir, bam_path: Path, min_var_freq: float = 0.2):
+def call_variants(
+    work_dir,
+    bam_path: Path,
+    min_var_freq: float = 0.2,
+    min_coverage: int = 8,
+    min_reads2: int = 2,
+):
     """Run VarScan variant calling."""
     logger.info("Calling variants with VarScan")
 
@@ -260,11 +270,11 @@ def call_variants(work_dir, bam_path: Path, min_var_freq: float = 0.2):
     config.run_bio(f"samtools faidx {ref}")
     config.run_bio(f"samtools mpileup -f {ref} {sorted_bam} > {pileup}")
     config.run_bio(
-        f"varscan mpileup2snp {pileup} --min-coverage 8 --min-reads2 2 "
+        f"varscan mpileup2snp {pileup} --min-coverage {min_coverage} --min-reads2 {min_reads2} "
         f"--min-var-freq {min_var_freq} --output-vcf 1 > {snps}"
     )
     config.run_bio(
-        f"varscan mpileup2indel {pileup} --min-coverage 8 --min-reads2 2 "
+        f"varscan mpileup2indel {pileup} --min-coverage {min_coverage} --min-reads2 {min_reads2} "
         f"--min-var-freq {min_var_freq} --output-vcf 1 > {indels}"
     )
 
@@ -748,7 +758,7 @@ def run_gene(gene_id, work_dir, cfg):
         gene_id: NCBI Gene ID
         work_dir: Directory for this gene's outputs
         cfg: Config dict with keys like 'hitlist_size', 'blast_expect',
-             'pseudo_read_phred', 'min_var_freq', 'bam_filtering'
+             'read_generation', 'variant_calling', 'bam_filtering'
              and optional 'keep_intermediate_files'
     """
     work_dir = Path(work_dir)
@@ -767,11 +777,14 @@ def run_gene(gene_id, work_dir, cfg):
 
     logger.info(f"Retrieved {result.sequence_count} sequences from {result.species_count} species")
 
+    read_generation_cfg = cfg["read_generation"]
     # Step 3: Generate pseudoreads
     generate_pseudoreads(
         input_fastq=str(result.fastq_path),
         work_dir=work_dir,
-        phred=cfg.get("pseudo_read_phred", 30),
+        read_len=read_generation_cfg["read_len"],
+        step=read_generation_cfg["step"],
+        phred=read_generation_cfg["pseudo_read_phred"],
     )
 
     # Step 4: Align pseudoreads
@@ -785,6 +798,8 @@ def run_gene(gene_id, work_dir, cfg):
         filter_result = filter_bam_for_gene(
             work_dir=work_dir,
             filtering_cfg=bam_filtering_cfg,
+            read_len=read_generation_cfg["read_len"],
+            step=read_generation_cfg["step"],
             verbose=False,
         )
         bam_for_variants = filter_result.output_bam
@@ -793,10 +808,13 @@ def run_gene(gene_id, work_dir, cfg):
         logger.info("BAM filtering disabled by config; using aln.sorted.bam")
 
     # Step 6: Call variants
+    variant_calling_cfg = cfg["variant_calling"]
     call_variants(
         work_dir,
         bam_for_variants,
-        min_var_freq=cfg.get("min_var_freq", 0.2),
+        min_var_freq=variant_calling_cfg["min_var_freq"],
+        min_coverage=variant_calling_cfg["min_coverage"],
+        min_reads2=variant_calling_cfg["min_reads2"],
     )
 
     # Step 7: Normalize VCF
