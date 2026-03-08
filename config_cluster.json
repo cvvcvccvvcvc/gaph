@@ -12,6 +12,9 @@
     "min_coverage": 8,
     "min_reads2": 2
   },
+  "ortholog_selection": {
+    "scope": "mammals"
+  },
   "data_dir": "/mnt/tank/scratch/ilunegov/GAPH/data",
   "runs_dir": "/mnt/tank/scratch/ilunegov/GAPH/runs",
   "gnomad_dir": "/mnt/tank/scratch/ilunegov/GAPH/data/gnomad_variants",
