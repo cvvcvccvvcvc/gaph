@@ -2,6 +2,7 @@
 
 import gzip
 import json
+import re
 import shutil
 import subprocess
 import tempfile
@@ -23,7 +24,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
     """Retrieve orthologs via NCBI Datasets CLI.
 
     This source:
-    1. Runs `datasets download gene gene-id {id} --ortholog all --include gene`
+    1. Runs `datasets download gene gene-id {id} --ortholog <scope> --include gene`
     2. Reads gene sequences directly from gene.fna (single download vs many Entrez.efetch calls)
     3. Deduplicates sequences (one per organism, preferring NC_ over NW_ accessions)
     4. Outputs sequences in FASTQ format
@@ -67,20 +68,46 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         raise RuntimeError(f"datasets CLI not found. Tried: {candidates}")
 
     @staticmethod
-    def _cache_fastq_path(cache_dir: Path, gene_id: int) -> Path:
-        return Path(cache_dir) / f"gene_{gene_id}.fastq.gz"
+    def _normalized_ortholog_scope(scope: str | None) -> str:
+        if scope is None:
+            return "all"
+        normalized = str(scope).strip().lower()
+        return normalized if normalized else "all"
 
     @staticmethod
-    def _cache_meta_path(cache_dir: Path, gene_id: int) -> Path:
-        return Path(cache_dir) / f"gene_{gene_id}.meta.json"
+    def _scope_slug(scope: str | None) -> str:
+        normalized = NCBIDatasetsOrthologSource._normalized_ortholog_scope(scope)
+        if normalized == "all":
+            return "all"
+        slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+        return slug if slug else "all"
 
-    def has_cached(self, gene_id: int, cache_dir: Path) -> bool:
-        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+    @classmethod
+    def _cache_fastq_path(cls, cache_dir: Path, gene_id: int, ortholog_scope: str = "all") -> Path:
+        scope_slug = cls._scope_slug(ortholog_scope)
+        suffix = "" if scope_slug == "all" else f"__scope_{scope_slug}"
+        return Path(cache_dir) / f"gene_{gene_id}{suffix}.fastq.gz"
+
+    @classmethod
+    def _cache_meta_path(cls, cache_dir: Path, gene_id: int, ortholog_scope: str = "all") -> Path:
+        scope_slug = cls._scope_slug(ortholog_scope)
+        suffix = "" if scope_slug == "all" else f"__scope_{scope_slug}"
+        return Path(cache_dir) / f"gene_{gene_id}{suffix}.meta.json"
+
+    def has_cached(self, gene_id: int, cache_dir: Path, ortholog_scope: str = "all") -> bool:
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id, ortholog_scope=ortholog_scope)
         return cache_fastq.exists() and cache_fastq.stat().st_size > 0
 
-    def load_cached(self, gene_id: int, cache_dir: Path, output_fastq: Path) -> OrthologResult | None:
+    def load_cached(
+        self,
+        gene_id: int,
+        cache_dir: Path,
+        output_fastq: Path,
+        ortholog_scope: str = "all",
+    ) -> OrthologResult | None:
         """Restore cached ortholog FASTQ to output_fastq if present."""
-        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id, ortholog_scope=ortholog_scope)
         if not cache_fastq.exists():
             return None
 
@@ -88,7 +115,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         with gzip.open(cache_fastq, "rb") as src, open(output_fastq, "wb") as dst:
             shutil.copyfileobj(src, dst)
 
-        meta = self._read_cache_meta(gene_id, cache_dir)
+        meta = self._read_cache_meta(gene_id, cache_dir, ortholog_scope=ortholog_scope)
         if meta:
             species_count = int(meta.get("species_count", 0))
             sequence_count = int(meta.get("sequence_count", 0))
@@ -101,7 +128,11 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             fastq_path=output_fastq,
             species_count=species_count,
             sequence_count=sequence_count,
-            metadata={"source": "ncbi_datasets_cache", "gene_id": gene_id},
+            metadata={
+                "source": "ncbi_datasets_cache",
+                "gene_id": gene_id,
+                "ortholog_scope": ortholog_scope,
+            },
         )
 
     def save_to_cache(
@@ -112,12 +143,14 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         species_count: int,
         sequence_count: int,
         source_tag: str = "ncbi_datasets",
+        ortholog_scope: str = "all",
     ) -> Path:
         """Save an ortholog FASTQ to persistent cache as gzip."""
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
-        cache_fastq = self._cache_fastq_path(cache_dir, gene_id)
+        cache_fastq = self._cache_fastq_path(cache_dir, gene_id, ortholog_scope=ortholog_scope)
         with open(source_fastq, "rb") as src, gzip.open(cache_fastq, "wb", compresslevel=1) as dst:
             shutil.copyfileobj(src, dst)
 
@@ -127,6 +160,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             source=source_tag,
             species_count=species_count,
             sequence_count=sequence_count,
+            ortholog_scope=ortholog_scope,
         )
         return cache_fastq
 
@@ -137,19 +171,23 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         source: str,
         species_count: int,
         sequence_count: int,
+        ortholog_scope: str = "all",
     ) -> None:
-        meta_path = self._cache_meta_path(cache_dir, gene_id)
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
+        meta_path = self._cache_meta_path(cache_dir, gene_id, ortholog_scope=ortholog_scope)
         payload = {
             "gene_id": int(gene_id),
             "source": source,
+            "ortholog_scope": ortholog_scope,
             "species_count": int(species_count),
             "sequence_count": int(sequence_count),
         }
         with open(meta_path, "w") as f:
             json.dump(payload, f, indent=2)
 
-    def _read_cache_meta(self, gene_id: int, cache_dir: Path) -> dict | None:
-        meta_path = self._cache_meta_path(cache_dir, gene_id)
+    def _read_cache_meta(self, gene_id: int, cache_dir: Path, ortholog_scope: str = "all") -> dict | None:
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
+        meta_path = self._cache_meta_path(cache_dir, gene_id, ortholog_scope=ortholog_scope)
         if not meta_path.exists():
             return None
         try:
@@ -170,6 +208,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         self,
         gene_id: int,
         output_dir: Path,
+        ortholog_scope: str = "all",
     ) -> OrthologResult:
         """Fetch orthologs via NCBI Datasets CLI.
 
@@ -182,6 +221,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         """
         output_dir = Path(output_dir)
         output_dir.mkdir(parents=True, exist_ok=True)
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
 
         zip_path = output_dir / "ncbi_dataset.zip"
         data_dir = output_dir / "ncbi_dataset" / "data"
@@ -189,7 +229,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         fastq_path = output_dir / "genes_from_coordinates.fastq"
 
         # Step 1: Download ortholog data
-        self._download_orthologs(gene_id, output_dir, zip_path)
+        self._download_orthologs(gene_id, output_dir, zip_path, ortholog_scope=ortholog_scope)
 
         # Step 2: Extract zip
         self._extract_zip(zip_path, output_dir)
@@ -201,15 +241,25 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             fastq_path=fastq_path,
             species_count=species_count,
             sequence_count=sequence_count,
-            metadata={"source": "ncbi_datasets", "gene_id": gene_id},
+            metadata={
+                "source": "ncbi_datasets",
+                "gene_id": gene_id,
+                "ortholog_scope": ortholog_scope,
+            },
         )
 
-    def prefetch_to_cache(self, gene_ids: list[int], cache_dir: Path) -> set[int]:
+    def prefetch_to_cache(
+        self,
+        gene_ids: list[int],
+        cache_dir: Path,
+        ortholog_scope: str = "all",
+    ) -> set[int]:
         """Batch-download orthologs for many query genes and write per-gene cache files.
 
         Only writes processed per-gene FASTQ cache files (gzip), no persistent raw batch zip.
         Returns gene IDs for which cached FASTQ was produced.
         """
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
         cache_dir = Path(cache_dir)
         cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -222,12 +272,16 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             seen.add(gid_int)
             dedup_gene_ids.append(gid_int)
 
-        missing = [gid for gid in dedup_gene_ids if not self.has_cached(gid, cache_dir)]
+        missing = [gid for gid in dedup_gene_ids if not self.has_cached(gid, cache_dir, ortholog_scope=ortholog_scope)]
         if not missing:
             return set()
 
         requested = {str(gid) for gid in missing}
-        logger.info(f"Batch downloading NCBI orthologs for {len(missing)} gene(s)")
+        logger.info(
+            "Batch downloading NCBI orthologs for {} gene(s) (ortholog_scope={})",
+            len(missing),
+            ortholog_scope,
+        )
 
         with tempfile.TemporaryDirectory(prefix="ncbi_prefetch_", dir=str(cache_dir)) as tmp:
             tmp_dir = Path(tmp)
@@ -235,7 +289,12 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             batch_zip = tmp_dir / "ncbi_dataset_batch.zip"
             input_ids.write_text("\n".join(str(gid) for gid in missing) + "\n")
 
-            self._download_orthologs_batch(input_ids, tmp_dir, batch_zip)
+            self._download_orthologs_batch(
+                input_ids,
+                tmp_dir,
+                batch_zip,
+                ortholog_scope=ortholog_scope,
+            )
             self._extract_zip(batch_zip, tmp_dir)
 
             data_dir = tmp_dir / "ncbi_dataset" / "data"
@@ -255,7 +314,8 @@ class NCBIDatasetsOrthologSource(OrthologSource):
                     source_fastq=tmp_fastq,
                     species_count=species_count,
                     sequence_count=sequence_count,
-                    source_tag="ncbi_datasets_batch",
+                    source_tag=f"ncbi_datasets_batch_{ortholog_scope}",
+                    ortholog_scope=ortholog_scope,
                 )
                 produced.add(gid)
 
@@ -271,8 +331,10 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         gene_ids_file: Path,
         output_dir: Path,
         zip_path: Path,
+        ortholog_scope: str = "all",
     ) -> None:
         """Download batch ortholog data using datasets CLI input file."""
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
         datasets_cmd = self._get_datasets_cmd()
         cmd = [
             datasets_cmd,
@@ -282,7 +344,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             "--inputfile",
             str(gene_ids_file),
             "--ortholog",
-            "all",
+            ortholog_scope,
             "--include",
             "gene",
             "--filename",
@@ -406,10 +468,19 @@ class NCBIDatasetsOrthologSource(OrthologSource):
         return count, count
 
     def _download_orthologs(
-        self, gene_id: int, output_dir: Path, zip_path: Path
+        self,
+        gene_id: int,
+        output_dir: Path,
+        zip_path: Path,
+        ortholog_scope: str = "all",
     ) -> None:
         """Download ortholog data using datasets CLI."""
-        logger.info(f"Downloading orthologs for gene {gene_id} via NCBI Datasets CLI")
+        ortholog_scope = self._normalized_ortholog_scope(ortholog_scope)
+        logger.info(
+            "Downloading orthologs for gene {} via NCBI Datasets CLI (ortholog_scope={})",
+            gene_id,
+            ortholog_scope,
+        )
 
         datasets_cmd = self._get_datasets_cmd()
         cmd = [
@@ -419,7 +490,7 @@ class NCBIDatasetsOrthologSource(OrthologSource):
             "gene-id",
             str(gene_id),
             "--ortholog",
-            "all",
+            ortholog_scope,
             "--include",
             "gene",  # Downloads gene.fna with all sequences
             "--filename",
