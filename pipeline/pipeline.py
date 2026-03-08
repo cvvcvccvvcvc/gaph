@@ -185,6 +185,24 @@ def validate_variant_calling_cfg(cfg: dict) -> dict:
     }
 
 
+def validate_ortholog_selection_cfg(cfg: dict) -> dict:
+    """Validate and normalize ortholog selection parameters."""
+    raw = cfg.get("ortholog_selection", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TypeError(f"'ortholog_selection' must be an object, got: {type(raw).__name__}")
+
+    scope = raw.get("scope", "all")
+    if not isinstance(scope, str):
+        raise TypeError(f"ortholog_selection.scope must be a string, got: {scope!r}")
+    scope = scope.strip().lower()
+    if not scope:
+        scope = "all"
+
+    return {"scope": scope}
+
+
 def validate_cache_cfg(cfg: dict) -> dict:
     """Validate and normalize optional cache configuration."""
     raw = cfg.get("cache", {})
@@ -321,6 +339,7 @@ def main():
     )
     cfg["read_generation"] = validate_read_generation_cfg(cfg)
     cfg["variant_calling"] = validate_variant_calling_cfg(cfg)
+    cfg["ortholog_selection"] = validate_ortholog_selection_cfg(cfg)
     cfg["resume_run_dir"] = _validate_resume_run_dir_cfg(cfg)
     cfg["bam_filtering"] = validate_bam_filtering_cfg(cfg)
     cfg["cache"] = validate_cache_cfg(cfg)
@@ -379,6 +398,7 @@ def main():
             "blast_expect": cfg["blast_expect"],
             "read_generation": cfg["read_generation"],
             "variant_calling": cfg["variant_calling"],
+            "ortholog_selection": cfg["ortholog_selection"],
             "resume_run_dir": str(resume_run_dir) if resume_run_dir else None,
             "bam_filtering": cfg["bam_filtering"],
             "cache": cfg["cache"],
@@ -413,6 +433,7 @@ def main():
     logger.info(f"BLAST parameters: hitlist_size={cfg['hitlist_size']}, expect={cfg['blast_expect']}")
     logger.info(f"Read generation config: {cfg['read_generation']}")
     logger.info(f"Variant calling config: {cfg['variant_calling']}")
+    logger.info(f"Ortholog selection config: {cfg['ortholog_selection']}")
     logger.info(f"BAM filtering config: {cfg['bam_filtering']}")
     logger.info(f"Cache config: {cfg['cache']}")
 
@@ -452,6 +473,7 @@ def main():
                 produced = prefetch_source.prefetch_to_cache(
                     gene_ids=upcoming,
                     cache_dir=config.NCBI_ORTHOLOG_CACHE_DIR,
+                    ortholog_scope=cfg["ortholog_selection"]["scope"],
                 )
                 logger.info(
                     "NCBI ortholog prefetch completed: {} cached gene(s)",
