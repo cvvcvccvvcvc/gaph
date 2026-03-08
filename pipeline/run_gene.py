@@ -5,9 +5,11 @@ All functions take an explicit work_dir parameter — no os.chdir().
 
 import gzip
 import json
+import csv
 import re
 import shutil
 import time
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -25,14 +27,37 @@ def _cache_enabled(cfg: dict, key: str) -> bool:
     return bool(cache_cfg.get("enabled", True) and cache_cfg.get(key, True))
 
 
-def _ortholog_cache_paths(gene_id: int, source_name: str) -> tuple[Path, Path]:
+def _normalized_ortholog_scope(scope: str | None) -> str:
+    if scope is None:
+        return "all"
+    normalized = str(scope).strip().lower()
+    return normalized if normalized else "all"
+
+
+def _scope_slug(scope: str) -> str:
+    normalized = _normalized_ortholog_scope(scope)
+    if normalized == "all":
+        return "all"
+    slug = re.sub(r"[^a-z0-9]+", "_", normalized).strip("_")
+    return slug if slug else "all"
+
+
+def _ortholog_cache_paths(
+    gene_id: int,
+    source_name: str,
+    ortholog_scope: str = "all",
+) -> tuple[Path, Path]:
     if source_name == "ncbi_datasets":
         base = config.NCBI_ORTHOLOG_CACHE_DIR
+        scope_slug = _scope_slug(ortholog_scope)
+        suffix = "" if scope_slug == "all" else f"__scope_{scope_slug}"
+        stem = f"gene_{gene_id}{suffix}"
     elif source_name == "blast":
         base = config.BLAST_ORTHOLOG_CACHE_DIR
+        stem = f"gene_{gene_id}"
     else:
         raise ValueError(f"Unknown ortholog cache source: {source_name}")
-    return base / f"gene_{gene_id}.fastq.gz", base / f"gene_{gene_id}.meta.json"
+    return base / f"{stem}.fastq.gz", base / f"{stem}.meta.json"
 
 
 def _count_fastq_records(fastq_path: Path) -> int:
@@ -43,8 +68,13 @@ def _count_fastq_records(fastq_path: Path) -> int:
     return lines // 4
 
 
-def _load_ortholog_cache(gene_id: int, source_name: str, work_dir: Path) -> tuple[int, int] | None:
-    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name)
+def _load_ortholog_cache(
+    gene_id: int,
+    source_name: str,
+    work_dir: Path,
+    ortholog_scope: str = "all",
+) -> tuple[int, int] | None:
+    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name, ortholog_scope=ortholog_scope)
     if not cache_fastq_gz.exists() or cache_fastq_gz.stat().st_size == 0:
         return None
 
@@ -80,8 +110,9 @@ def _save_ortholog_cache(
     fastq_path: Path,
     species_count: int,
     sequence_count: int,
+    ortholog_scope: str = "all",
 ) -> None:
-    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name)
+    cache_fastq_gz, cache_meta = _ortholog_cache_paths(gene_id, source_name, ortholog_scope=ortholog_scope)
     cache_fastq_gz.parent.mkdir(parents=True, exist_ok=True)
 
     with open(fastq_path, "rb") as src, gzip.open(cache_fastq_gz, "wb", compresslevel=1) as dst:
@@ -90,11 +121,56 @@ def _save_ortholog_cache(
     payload = {
         "gene_id": int(gene_id),
         "source": source_name,
+        "ortholog_scope": _normalized_ortholog_scope(ortholog_scope),
         "species_count": int(species_count),
         "sequence_count": int(sequence_count),
     }
     with open(cache_meta, "w") as f:
         json.dump(payload, f, indent=2)
+
+
+def _ortholog_resolution_csv_path(work_dir: Path) -> Path:
+    return Path(work_dir).parent / "ortholog_resolution.csv"
+
+
+def _append_ortholog_resolution_csv(
+    work_dir: Path,
+    gene_id: int,
+    requested_scope: str,
+    effective_scope: str,
+    source_used: str,
+    from_cache: bool,
+    species_count: int,
+    sequence_count: int,
+) -> None:
+    csv_path = _ortholog_resolution_csv_path(work_dir)
+    csv_path.parent.mkdir(parents=True, exist_ok=True)
+    write_header = (not csv_path.exists()) or csv_path.stat().st_size == 0
+    fields = [
+        "timestamp",
+        "gene_id",
+        "requested_scope",
+        "effective_scope",
+        "source_used",
+        "from_cache",
+        "species_count",
+        "sequence_count",
+    ]
+    row = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "gene_id": int(gene_id),
+        "requested_scope": _normalized_ortholog_scope(requested_scope),
+        "effective_scope": _normalized_ortholog_scope(effective_scope),
+        "source_used": source_used,
+        "from_cache": "true" if from_cache else "false",
+        "species_count": int(species_count),
+        "sequence_count": int(sequence_count),
+    }
+    with open(csv_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
 
 
 def _gene_seq_cache_paths(gene_id: int) -> tuple[Path, Path]:
@@ -648,65 +724,147 @@ def annotate_variants(work_dir, gnomad_vcf_gz=None):
 
 
 def _fetch_orthologs(gene_id, work_dir, cfg):
-    """Fetch orthologs with cache reuse: NCBI cache -> BLAST cache -> live fetches."""
-    output_fastq = Path(work_dir) / "genes_from_coordinates.fastq"
+    """Resolve orthologs via chain: NCBI(requested) -> NCBI(all) -> BLAST."""
+    work_dir = Path(work_dir)
+    output_fastq = work_dir / "genes_from_coordinates.fastq"
+    requested_scope = _normalized_ortholog_scope(
+        (cfg.get("ortholog_selection", {}) or {}).get("scope", "all")
+    )
+    ncbi_cache_enabled = _cache_enabled(cfg, "orthologs_ncbi")
+    blast_cache_enabled = _cache_enabled(cfg, "orthologs_blast")
 
-    if _cache_enabled(cfg, "orthologs_ncbi"):
-        cached = _load_ortholog_cache(gene_id, "ncbi_datasets", Path(work_dir))
-        if cached:
-            species_count, sequence_count = cached
-            logger.info(f"Using cached NCBI orthologs for gene {gene_id}")
+    def _record_and_wrap(
+        *,
+        species_count: int,
+        sequence_count: int,
+        metadata: dict,
+        effective_scope: str,
+        source_used: str,
+        from_cache: bool,
+    ) -> OrthologResult:
+        _append_ortholog_resolution_csv(
+            work_dir=work_dir,
+            gene_id=gene_id,
+            requested_scope=requested_scope,
+            effective_scope=effective_scope,
+            source_used=source_used,
+            from_cache=from_cache,
+            species_count=species_count,
+            sequence_count=sequence_count,
+        )
+        return OrthologResult(
+            fastq_path=output_fastq,
+            species_count=species_count,
+            sequence_count=sequence_count,
+            metadata=metadata,
+        )
 
-            return OrthologResult(
-                fastq_path=output_fastq,
-                species_count=species_count,
-                sequence_count=sequence_count,
-                metadata={"source": "ncbi_datasets_cache", "gene_id": gene_id},
+    ncbi_source = get_source("ncbi_datasets")
+    ncbi_scopes = [requested_scope]
+    if requested_scope != "all":
+        ncbi_scopes.append("all")
+
+    for scope in ncbi_scopes:
+        source_used = "ncbi_scope" if scope != "all" else "ncbi_all"
+        if ncbi_cache_enabled:
+            cached = _load_ortholog_cache(
+                gene_id,
+                "ncbi_datasets",
+                work_dir,
+                ortholog_scope=scope,
+            )
+            if cached:
+                species_count, sequence_count = cached
+                logger.info(
+                    "Using cached NCBI orthologs for gene {} (ortholog_scope={})",
+                    gene_id,
+                    scope,
+                )
+                return _record_and_wrap(
+                    species_count=species_count,
+                    sequence_count=sequence_count,
+                    metadata={
+                        "source": "ncbi_datasets_cache",
+                        "gene_id": gene_id,
+                        "ortholog_scope": scope,
+                    },
+                    effective_scope=scope,
+                    source_used=source_used,
+                    from_cache=True,
+                )
+
+        try:
+            logger.info(
+                "Fetching orthologs with ncbi_datasets source (ortholog_scope={})",
+                scope,
+            )
+            result = ncbi_source.fetch(gene_id=gene_id, output_dir=work_dir, ortholog_scope=scope)
+            if result.sequence_count > 0:
+                if ncbi_cache_enabled:
+                    try:
+                        if hasattr(ncbi_source, "save_to_cache"):
+                            ncbi_source.save_to_cache(
+                                gene_id=gene_id,
+                                cache_dir=config.NCBI_ORTHOLOG_CACHE_DIR,
+                                source_fastq=result.fastq_path,
+                                species_count=result.species_count,
+                                sequence_count=result.sequence_count,
+                                source_tag=f"ncbi_datasets_{scope}",
+                                ortholog_scope=scope,
+                            )
+                        else:
+                            _save_ortholog_cache(
+                                gene_id=gene_id,
+                                source_name="ncbi_datasets",
+                                fastq_path=result.fastq_path,
+                                species_count=result.species_count,
+                                sequence_count=result.sequence_count,
+                                ortholog_scope=scope,
+                            )
+                    except Exception as e:
+                        logger.warning(
+                            "Failed to cache NCBI orthologs for gene {} (ortholog_scope={}): {}",
+                            gene_id,
+                            scope,
+                            e,
+                        )
+                return _record_and_wrap(
+                    species_count=result.species_count,
+                    sequence_count=result.sequence_count,
+                    metadata={
+                        **(result.metadata or {}),
+                        "ortholog_scope": scope,
+                    },
+                    effective_scope=scope,
+                    source_used=source_used,
+                    from_cache=False,
+                )
+            logger.warning(
+                "ncbi_datasets returned 0 sequences for gene {} (ortholog_scope={}), trying next fallback",
+                gene_id,
+                scope,
+            )
+        except Exception as e:
+            logger.warning(
+                "ncbi_datasets failed for gene {} (ortholog_scope={}): {}, trying next fallback",
+                gene_id,
+                scope,
+                e,
             )
 
-    if _cache_enabled(cfg, "orthologs_blast"):
-        cached = _load_ortholog_cache(gene_id, "blast", Path(work_dir))
+    if blast_cache_enabled:
+        cached = _load_ortholog_cache(gene_id, "blast", work_dir)
         if cached:
             species_count, sequence_count = cached
             logger.info(f"Using cached BLAST orthologs for gene {gene_id}")
-
-            return OrthologResult(
-                fastq_path=output_fastq,
+            return _record_and_wrap(
                 species_count=species_count,
                 sequence_count=sequence_count,
                 metadata={"source": "blast_cache", "gene_id": gene_id},
+                effective_scope="all",
+                source_used="blast",
+                from_cache=True,
             )
-
-    ncbi_source = get_source("ncbi_datasets")
-    try:
-        logger.info("Fetching orthologs with ncbi_datasets source")
-        result = ncbi_source.fetch(gene_id=gene_id, output_dir=work_dir)
-        if result.sequence_count > 0:
-            if _cache_enabled(cfg, "orthologs_ncbi"):
-                try:
-                    if hasattr(ncbi_source, "save_to_cache"):
-                        ncbi_source.save_to_cache(
-                            gene_id=gene_id,
-                            cache_dir=config.NCBI_ORTHOLOG_CACHE_DIR,
-                            source_fastq=result.fastq_path,
-                            species_count=result.species_count,
-                            sequence_count=result.sequence_count,
-                            source_tag="ncbi_datasets",
-                        )
-                    else:
-                        _save_ortholog_cache(
-                            gene_id=gene_id,
-                            source_name="ncbi_datasets",
-                            fastq_path=result.fastq_path,
-                            species_count=result.species_count,
-                            sequence_count=result.sequence_count,
-                        )
-                except Exception as e:
-                    logger.warning(f"Failed to cache NCBI orthologs for gene {gene_id}: {e}")
-            return result
-        logger.warning("ncbi_datasets returned 0 sequences, falling back to BLAST")
-    except Exception as e:
-        logger.warning(f"ncbi_datasets failed: {e}, falling back to BLAST")
 
     logger.info("Fetching orthologs with blast source")
     blast_source = get_source("blast")
@@ -716,7 +874,7 @@ def _fetch_orthologs(gene_id, work_dir, cfg):
         hitlist_size=cfg.get("hitlist_size", 5000),
         expect=cfg.get("blast_expect", 10.0),
     )
-    if _cache_enabled(cfg, "orthologs_blast") and result.sequence_count > 0:
+    if blast_cache_enabled and result.sequence_count > 0:
         try:
             _save_ortholog_cache(
                 gene_id=gene_id,
@@ -727,7 +885,14 @@ def _fetch_orthologs(gene_id, work_dir, cfg):
             )
         except Exception as e:
             logger.warning(f"Failed to cache BLAST orthologs for gene {gene_id}: {e}")
-    return result
+    return _record_and_wrap(
+        species_count=result.species_count,
+        sequence_count=result.sequence_count,
+        metadata={**(result.metadata or {}), "ortholog_scope": "all"},
+        effective_scope="all",
+        source_used="blast",
+        from_cache=False,
+    )
 
 
 def _cleanup_gene_outputs(work_dir: Path, keep_paths: list[Path]) -> None:
@@ -758,7 +923,7 @@ def run_gene(gene_id, work_dir, cfg):
         gene_id: NCBI Gene ID
         work_dir: Directory for this gene's outputs
         cfg: Config dict with keys like 'hitlist_size', 'blast_expect',
-             'read_generation', 'variant_calling', 'bam_filtering'
+             'read_generation', 'variant_calling', 'ortholog_selection', 'bam_filtering'
              and optional 'keep_intermediate_files'
     """
     work_dir = Path(work_dir)
