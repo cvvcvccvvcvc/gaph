@@ -8,6 +8,7 @@ Validation happens in `pipeline/pipeline.py` before processing genes:
 - numeric core fields: hitlist/blast parameters in `pipeline/pipeline.py`
 - `read_generation` block: `pipeline/pipeline.py`
 - `variant_calling` block: `pipeline/pipeline.py`
+- `ortholog_selection` block: `pipeline/pipeline.py`
 - resume run path: `pipeline/pipeline.py:197`, `pipeline/pipeline.py:296`
 - BAM filtering block: `pipeline/pipeline.py:86`
 - cache block: `pipeline/pipeline.py:135`
@@ -44,9 +45,19 @@ Critical details:
 
 - cache flags are normalized in `pipeline/pipeline.py:159`
 - cache paths are expanded in `pipeline/config.py:108` to `pipeline/config.py:114`
+- NCBI ortholog cache keys are scope-aware (`all` keeps legacy file names, other scopes use `__scope_<slug>`)
 - ortholog cache writes currently use gzip `compresslevel=1`:
   - `pipeline/run_gene.py:86`
   - `pipeline/orthologs/ncbi_datasets_source.py:121`
+
+## Ortholog Resolution Rules
+
+- Requested scope comes from `ortholog_selection.scope`.
+- Resolution chain in runtime is:
+  1. NCBI requested scope (cache, then live fetch)
+  2. NCBI `all` (cache, then live fetch)
+  3. BLAST (cache, then live fetch)
+- Run-level audit is written to `ortholog_resolution.csv` in the run directory.
 
 ## Change Checklist
 

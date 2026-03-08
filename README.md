@@ -50,6 +50,9 @@ Example:
     "min_coverage": 8,
     "min_reads2": 2
   },
+  "ortholog_selection": {
+    "scope": "all"
+  },
   "env_file": ".env",
   "data_dir": "data",
   "runs_dir": "runs",
@@ -99,6 +102,15 @@ Example:
 - `hitlist_size`: max number of BLAST hits to request.
 - `blast_expect`: BLAST E-value cutoff (passed to `qblast(..., expect=...)`).
 
+### Ortholog selection
+
+- `ortholog_selection.scope`: requested NCBI ortholog scope (`all`, `mammals`, `eukaryota`, etc.).
+- Resolution order is fixed:
+  1. NCBI Datasets with requested scope
+  2. NCBI Datasets with `all`
+  3. BLAST fallback
+- NCBI ortholog cache is scope-aware when `scope != all`.
+
 ### Read generation parameters
 
 - `read_generation.pseudo_read_phred`: fixed PHRED assigned to generated pseudo-reads.
@@ -117,6 +129,7 @@ Run folder:
 
 - `runs/run_YYYYMMDD_HHMMSS/pipeline.log`
 - `runs/run_YYYYMMDD_HHMMSS/run_params.json`
+- `runs/run_YYYYMMDD_HHMMSS/ortholog_resolution.csv`
 - `runs/run_YYYYMMDD_HHMMSS/gene_<ID>/gene_snps_annotated.vcf` (final output)
 
 If `keep_intermediate_files=true`, gene directory also keeps intermediates such as:
