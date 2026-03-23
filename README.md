@@ -53,10 +53,11 @@ Example:
   "ortholog_selection": {
     "scope": "all"
   },
+  "run_name": "phase_a_all_80_40",
   "env_file": ".env",
   "data_dir": "data",
   "runs_dir": "runs",
-  "resume_run_dir": "runs/run_20260221_125031",
+  "resume_run_dir": "runs/run_phase_a_all_80_40",
   "gnomad_dir": "gnomad_variants",
   "conda_env": "bio",
   "keep_intermediate_files": false,
@@ -75,7 +76,10 @@ Example:
 ### Resume an existing run
 
 - `resume_run_dir` is optional.
-- If omitted, pipeline creates a new `runs/run_YYYYMMDD_HHMMSS` directory.
+- New run directories keep the `run_` prefix and use a readable config-based name.
+- If `run_name` is set, the first run is created as `runs/run_<run_name>`.
+- If `run_name` is not set, pipeline uses the config file stem, for example `runs/run_02_all_150_75`.
+- If that directory already exists, pipeline allocates `runs/run_<name>__2`, then `__3`, and so on.
 - If provided, pipeline inspects configured genes in order and resumes from:
   - the first gene with a non-terminal state (`gene_<id>/` exists but no `gene_snps_annotated.vcf` and no `failure.json`), or
   - the first missing gene directory if all previous genes are terminal.
@@ -117,6 +121,13 @@ Example:
 - `read_generation.read_len`: pseudo-read length.
 - `read_generation.step`: sliding-window step for pseudo-read generation.
 
+### Run naming
+
+- `run_name`: optional readable prefix for new run directories.
+- `run_name` is sanitized to filesystem-safe ASCII and stored in `run_params.json`.
+- `run_cluster.sh` preserves the original config basename in `run_name`, so temporary `gaph_cfg.*.json` files do not leak into run directory names.
+- Repeated runs with the same name get numeric suffixes: `run_name`, `run_name__2`, `run_name__3`, ...
+
 ### Variant calling parameters
 
 - `variant_calling.min_var_freq`: passed to VarScan as `--min-var-freq`.
@@ -127,10 +138,11 @@ Example:
 
 Run folder:
 
-- `runs/run_YYYYMMDD_HHMMSS/pipeline.log`
-- `runs/run_YYYYMMDD_HHMMSS/run_params.json`
-- `runs/run_YYYYMMDD_HHMMSS/ortholog_resolution.csv`
-- `runs/run_YYYYMMDD_HHMMSS/gene_<ID>/gene_snps_annotated.vcf` (final output)
+- `runs/run_<name>/pipeline.log` for the first run with that config/name
+- `runs/run_<name>/run_params.json`
+- `runs/run_<name>/ortholog_resolution.csv`
+- `runs/run_<name>/gene_<ID>/gene_snps_annotated.vcf` (final output)
+- repeated launches with the same name use `runs/run_<name>__2`, `runs/run_<name>__3`, ...
 
 If `keep_intermediate_files=true`, gene directory also keeps intermediates such as:
 

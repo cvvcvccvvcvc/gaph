@@ -23,15 +23,19 @@ Critical details:
 - project paths are resolved relative to repo root via `pipeline/config.py:33`
 - bio commands run through `run_bio(...)` in `pipeline/config.py:121`
 - `resume_run_dir` (if set) is resolved relative to repo root via `pipeline/pipeline.py:206`
+- `run_name` (if set) is validated in `pipeline/pipeline.py` and used as the readable prefix for new run directories
 
 ## Resume Rules
 
 - Optional config field: `resume_run_dir` (string path to existing run folder).
+- Optional config field: `run_name` (string prefix for new run folder names).
 - Gene terminal states in resume mode (`pipeline/pipeline.py:229`):
   - success: `gene_snps_annotated.vcf` exists and non-empty
   - failed: `failure.json` exists and non-empty
 - Resume start point is first non-terminal gene in config order (`pipeline/pipeline.py:243`).
 - If all genes are terminal, pipeline starts a new run directory (`pipeline/pipeline.py:316`).
+- New run directories keep the `run_` prefix and use `run_name` or the config stem as the base name.
+- If the base name already exists, a numeric suffix is appended: `__2`, `__3`, ...
 
 ## BAM Filtering Rules
 
