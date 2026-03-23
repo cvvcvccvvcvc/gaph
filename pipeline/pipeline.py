@@ -7,6 +7,7 @@ Usage:
 """
 
 import json
+import re
 import shutil
 import sys
 import traceback
@@ -270,6 +271,18 @@ def _validate_resume_run_dir_cfg(cfg: dict) -> str | None:
     return value.strip()
 
 
+def _validate_run_name_cfg(cfg: dict) -> str | None:
+    value = cfg.get("run_name")
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise TypeError(f"run_name must be a string, got: {value!r}")
+    value = value.strip()
+    if not value:
+        raise ValueError("run_name must not be empty when provided")
+    return value
+
+
 def _resolve_repo_path(path_str: str) -> Path:
     candidate = Path(path_str).expanduser()
     if candidate.is_absolute():
@@ -326,6 +339,40 @@ def _build_resume_plan(run_dir: Path, gene_ids: list[int]) -> dict:
     }
 
 
+def _slugify_run_name(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_-]+", "_", value.strip())
+    slug = re.sub(r"_+", "_", slug).strip("_-")
+    if not slug:
+        raise ValueError(
+            f"run_name must contain at least one ASCII letter or digit after sanitization, got: {value!r}"
+        )
+    return slug
+
+
+def _derive_run_name(config_path: str, cfg: dict) -> str | None:
+    explicit = cfg.get("run_name")
+    if explicit:
+        return _slugify_run_name(explicit)
+
+    source_config_path = cfg.get("source_config_path") or config_path
+    config_stem = Path(source_config_path).stem
+    return _slugify_run_name(config_stem)
+
+
+def _create_new_run_dir(run_name: str | None) -> tuple[str, Path]:
+    base_run_id = run_name or "config"
+
+    for suffix in range(1, 10_000):
+        run_id = base_run_id if suffix == 1 else f"{base_run_id}__{suffix}"
+        run_dir = config.RUNS_DIR / f"run_{run_id}"
+        if run_dir.exists():
+            continue
+        run_dir.mkdir(parents=True, exist_ok=False)
+        return run_id, run_dir
+
+    raise RuntimeError(f"Could not allocate unique run directory for base name: {base_run_id}")
+
+
 def main():
     # Load config
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.json"
@@ -341,9 +388,11 @@ def main():
     cfg["variant_calling"] = validate_variant_calling_cfg(cfg)
     cfg["ortholog_selection"] = validate_ortholog_selection_cfg(cfg)
     cfg["resume_run_dir"] = _validate_resume_run_dir_cfg(cfg)
+    cfg["run_name"] = _validate_run_name_cfg(cfg)
     cfg["bam_filtering"] = validate_bam_filtering_cfg(cfg)
     cfg["cache"] = validate_cache_cfg(cfg)
     config.init(cfg)
+    derived_run_name = _derive_run_name(config_path, cfg)
 
     # Set Entrez credentials
     Entrez.email = config.ENTREZ_EMAIL or None
@@ -378,13 +427,9 @@ def main():
             start_idx = int(resume_plan["start_index"])
             resume_mode = True
         else:
-            run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-            run_dir = config.RUNS_DIR / f"run_{run_id}"
-            run_dir.mkdir(parents=True, exist_ok=True)
+            run_id, run_dir = _create_new_run_dir(derived_run_name)
     else:
-        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = config.RUNS_DIR / f"run_{run_id}"
-        run_dir.mkdir(parents=True, exist_ok=True)
+        run_id, run_dir = _create_new_run_dir(derived_run_name)
 
     init_logging(run_dir / "pipeline.log")
 
@@ -399,10 +444,12 @@ def main():
             "read_generation": cfg["read_generation"],
             "variant_calling": cfg["variant_calling"],
             "ortholog_selection": cfg["ortholog_selection"],
+            "run_name": derived_run_name,
             "resume_run_dir": str(resume_run_dir) if resume_run_dir else None,
             "bam_filtering": cfg["bam_filtering"],
             "cache": cfg["cache"],
             "config_path": str(config_path),
+            "source_config_path": cfg.get("source_config_path"),
             "started_at": datetime.now().isoformat(timespec="seconds"),
         }
         with open(run_dir / "run_params.json", "w") as f:
