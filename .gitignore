@@ -14,4 +14,3 @@ analysis/
 .env
 gnomad_variants/
 tests/
-run_cluster.sh

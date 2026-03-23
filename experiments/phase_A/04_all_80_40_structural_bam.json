@@ -19,7 +19,7 @@
   "runs_dir": "/mnt/tank/scratch/ilunegov/GAPH/runs/phase_A",
   "gnomad_dir": "/mnt/tank/scratch/ilunegov/GAPH/data/gnomad_variants",
   "conda_env": "bio",
-  "keep_intermediate_files": true,
+  "keep_intermediate_files": false,
   "cache": {
     "enabled": true,
     "orthologs_ncbi": true,
