@@ -16,7 +16,7 @@
     "scope": "all"
   },
   "data_dir": "/mnt/tank/scratch/ilunegov/GAPH/data",
-  "runs_dir": "/mnt/tank/scratch/ilunegov/GAPH/runs/phase_A",
+  "runs_dir": "/mnt/tank/scratch/ilunegov/GAPH/runs/phase_B",
   "gnomad_dir": "/mnt/tank/scratch/ilunegov/GAPH/data/gnomad_variants",
   "conda_env": "bio",
   "keep_intermediate_files": false,
