@@ -13,7 +13,7 @@
     "min_reads2": 2
   },
   "ortholog_selection": {
-    "scope": "mammals"
+    "scope": "all"
   },
   "data_dir": "/mnt/tank/scratch/ilunegov/GAPH/data",
   "runs_dir": "/mnt/tank/scratch/ilunegov/GAPH/runs",
