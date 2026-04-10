@@ -3,7 +3,7 @@
 #SBATCH --partition=main
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=8G
-#SBATCH --time=48:00:00
+#SBATCH --time=100:00:00
 #SBATCH --output=/mnt/tank/scratch/%u/GAPH/runs/slurm-%j.out
 #SBATCH --error=/mnt/tank/scratch/%u/GAPH/runs/slurm-%j.err
 
