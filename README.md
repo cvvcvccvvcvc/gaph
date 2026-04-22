@@ -61,6 +61,9 @@ Example:
   "gnomad_dir": "gnomad_variants",
   "conda_env": "bio",
   "keep_intermediate_files": false,
+  "output_compaction": {
+    "enabled": false
+  },
   "bam_filtering": {
     "enabled": true,
     "wrong_strand": true,
@@ -88,6 +91,21 @@ Example:
   - `failure.json` exists and is non-empty (failed)
 - If all genes are terminal in `resume_run_dir`, a new run directory is created automatically.
 - In resume mode, existing terminal genes are skipped; incomplete gene directories are deleted and recomputed from scratch.
+- Compacted runs are also treated as terminal from `genes.csv.gz`; a compacted run with non-terminal genes is not resumable.
+
+### Output compaction
+
+Set `output_compaction.enabled=true` to replace per-gene raw outputs with compact run-level statistics after the run finishes.
+
+When enabled, the pipeline writes and validates:
+
+- `run_manifest.json`
+- `genes.csv.gz`
+- `variants.csv.gz`
+- `failure_events.csv.gz`
+- `analysis_summary.json.gz`
+
+Only after validation succeeds, all `gene_<ID>/` directories are deleted. With `enabled=false`, output behavior is unchanged.
 
 ### `bam_filtering` rules
 
@@ -143,6 +161,8 @@ Run folder:
 - `runs/run_<name>/ortholog_resolution.csv`
 - `runs/run_<name>/gene_<ID>/gene_snps_annotated.vcf` (final output)
 - repeated launches with the same name use `runs/run_<name>__2`, `runs/run_<name>__3`, ...
+
+If `output_compaction.enabled=true`, successful validation of the compact files removes `gene_<ID>/` directories and leaves compact run-level files in the run folder.
 
 If `keep_intermediate_files=true`, gene directory also keeps intermediates such as:
 
