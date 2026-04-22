@@ -10,7 +10,15 @@ __pycache__/
 *.pyc
 .DS_Store
 .ipynb_checkpoints/
-analysis/
+analysis/*
+!analysis/*.py
+!analysis/compare_runs_on_csv.ipynb
+!analysis/export_and_compare_runs.ipynb
+!analysis/data_runs/
+analysis/data_runs/*
+!analysis/data_runs/README.md
+analysis/results/
 .env
 gnomad_variants/
-tests/
+tests/*
+!tests/test_run_snapshot.py
