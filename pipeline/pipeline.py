@@ -19,6 +19,11 @@ from loguru import logger
 
 import config
 from orthologs import get_source
+from run_compaction import (
+    compact_run_in_place,
+    load_compacted_gene_status,
+    run_has_compacted_snapshot,
+)
 from run_gene import run_gene
 
 GENE_SUCCESS_ARTIFACT = "gene_snps_annotated.vcf"
@@ -252,6 +257,21 @@ def validate_cache_cfg(cfg: dict) -> dict:
     return validated
 
 
+def validate_output_compaction_cfg(cfg: dict) -> dict:
+    """Validate and normalize optional post-run output compaction."""
+    raw = cfg.get("output_compaction", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise TypeError(f"'output_compaction' must be an object, got: {type(raw).__name__}")
+
+    enabled = raw.get("enabled", False)
+    if not isinstance(enabled, bool):
+        raise TypeError(f"output_compaction.enabled must be boolean, got: {enabled!r}")
+
+    return {"enabled": enabled}
+
+
 def _write_json(path: Path, payload) -> None:
     with open(path, "w") as f:
         json.dump(payload, f, indent=2)
@@ -317,6 +337,11 @@ def _gene_status(run_dir: Path, gene_id: int) -> str:
         return "failed"
     if gene_dir.exists():
         return "incomplete"
+
+    compacted_status = load_compacted_gene_status(run_dir, gene_id)
+    if compacted_status in {"success", "failed", "incomplete", "missing"}:
+        return compacted_status
+
     return "missing"
 
 
@@ -391,6 +416,7 @@ def main():
     cfg["run_name"] = _validate_run_name_cfg(cfg)
     cfg["bam_filtering"] = validate_bam_filtering_cfg(cfg)
     cfg["cache"] = validate_cache_cfg(cfg)
+    cfg["output_compaction"] = validate_output_compaction_cfg(cfg)
     config.init(cfg)
     derived_run_name = _derive_run_name(config_path, cfg)
 
@@ -421,6 +447,11 @@ def main():
             )
 
         resume_plan = _build_resume_plan(resume_run_dir, cfg["gene_ids"])
+        if run_has_compacted_snapshot(resume_run_dir) and resume_plan["start_index"] is not None:
+            raise ValueError(
+                "Cannot resume a compacted run with non-terminal genes. "
+                f"Run: {resume_run_dir}; progress snapshot: {resume_plan['counts']}"
+            )
         if resume_plan["start_index"] is not None:
             run_dir = resume_run_dir
             run_id = run_dir.name[4:] if run_dir.name.startswith("run_") else run_dir.name
@@ -448,6 +479,7 @@ def main():
             "resume_run_dir": str(resume_run_dir) if resume_run_dir else None,
             "bam_filtering": cfg["bam_filtering"],
             "cache": cfg["cache"],
+            "output_compaction": cfg["output_compaction"],
             "config_path": str(config_path),
             "source_config_path": cfg.get("source_config_path"),
             "started_at": datetime.now().isoformat(timespec="seconds"),
@@ -483,6 +515,7 @@ def main():
     logger.info(f"Ortholog selection config: {cfg['ortholog_selection']}")
     logger.info(f"BAM filtering config: {cfg['bam_filtering']}")
     logger.info(f"Cache config: {cfg['cache']}")
+    logger.info(f"Output compaction config: {cfg['output_compaction']}")
 
     # Optional NCBI ortholog prefetch (batch) into cache.
     cache_cfg = cfg["cache"]
@@ -589,6 +622,17 @@ def main():
     )
     if failed_count > 0:
         logger.warning("Failure report: {}", failed_genes_jsonl)
+
+    if cfg["output_compaction"]["enabled"]:
+        logger.info("Output compaction enabled; writing compact statistics and deleting raw gene directories")
+        compaction_result = compact_run_in_place(run_dir)
+        logger.success(
+            "Output compaction complete (success={}, failed={}, variants={}, deleted_gene_dirs={})",
+            compaction_result.successful_genes,
+            compaction_result.failed_genes,
+            compaction_result.total_variants,
+            compaction_result.deleted_gene_dirs,
+        )
 
 
 if __name__ == "__main__":

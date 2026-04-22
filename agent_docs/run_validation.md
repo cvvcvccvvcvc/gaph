@@ -28,6 +28,7 @@ Entrypoint details:
 3. Each successful gene ends with `gene_snps_annotated.vcf` (`pipeline/run_gene.py:561`).
 4. If `keep_intermediate_files=false`, intermediates are removed (`pipeline/run_gene.py:565`).
 5. No hidden gene failures: inspect `failed_genes.jsonl` if present (`pipeline/pipeline.py:279`).
+6. If `output_compaction.enabled=true`, verify compact files exist and `gene_<ID>/` directories were removed only after validation.
 
 ## Useful Checks
 
@@ -47,6 +48,13 @@ Count successful final VCFs in run:
 
 ```bash
 find runs/<run_id> -name gene_snps_annotated.vcf | wc -l
+```
+
+Check compacted output:
+
+```bash
+ls runs/<run_id>/run_manifest.json runs/<run_id>/genes.csv.gz runs/<run_id>/variants.csv.gz
+find runs/<run_id> -maxdepth 1 -type d -name 'gene_*' | wc -l
 ```
 
 Inspect resume events:

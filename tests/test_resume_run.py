@@ -1,4 +1,7 @@
 from pathlib import Path
+import csv
+import gzip
+import json
 import sys
 import types
 
@@ -53,6 +56,7 @@ loguru_stub.logger = _LoggerStub()
 sys.modules.setdefault("loguru", loguru_stub)
 
 import pipeline as pipeline_main  # noqa: E402
+from run_compaction import compact_run_in_place, load_exported_run_data  # noqa: E402
 
 
 def _touch(path: Path, content: str = "x") -> None:
@@ -71,6 +75,18 @@ def test_validate_resume_run_dir_cfg():
         pipeline_main._validate_resume_run_dir_cfg({"resume_run_dir": 123})
 
 
+def test_validate_output_compaction_cfg():
+    assert pipeline_main.validate_output_compaction_cfg({}) == {"enabled": False}
+    assert pipeline_main.validate_output_compaction_cfg({"output_compaction": None}) == {"enabled": False}
+    assert pipeline_main.validate_output_compaction_cfg({"output_compaction": {"enabled": True}}) == {"enabled": True}
+
+    with pytest.raises(TypeError):
+        pipeline_main.validate_output_compaction_cfg({"output_compaction": []})
+
+    with pytest.raises(TypeError):
+        pipeline_main.validate_output_compaction_cfg({"output_compaction": {"enabled": "yes"}})
+
+
 def test_gene_status_success_failed_incomplete_missing(tmp_path):
     run_dir = tmp_path / "run_1"
 
@@ -82,6 +98,77 @@ def test_gene_status_success_failed_incomplete_missing(tmp_path):
     assert pipeline_main._gene_status(run_dir, 2) == "failed"
     assert pipeline_main._gene_status(run_dir, 3) == "incomplete"
     assert pipeline_main._gene_status(run_dir, 4) == "missing"
+
+
+def test_gene_status_uses_compacted_snapshot_when_gene_dir_was_deleted(tmp_path):
+    run_dir = tmp_path / "run_1"
+    run_dir.mkdir()
+    (run_dir / "run_manifest.json").write_text(
+        json.dumps({"counts": {"gene_rows": 2, "successful_genes": 1, "failed_genes": 1}})
+    )
+    with gzip.open(run_dir / "genes.csv.gz", "wt", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=["gene_id", "status"])
+        writer.writeheader()
+        writer.writerow({"gene_id": "1", "status": "success"})
+        writer.writerow({"gene_id": "2", "status": "failed"})
+
+    assert pipeline_main._gene_status(run_dir, 1) == "success"
+    assert pipeline_main._gene_status(run_dir, 2) == "failed"
+    assert pipeline_main._gene_status(run_dir, 3) == "missing"
+
+
+def test_compact_run_in_place_writes_snapshot_and_deletes_gene_dirs(tmp_path):
+    run_dir = tmp_path / "run_alpha"
+    _make_compaction_run(
+        run_dir,
+        params={"run_id": "alpha", "gene_ids": [1, 2]},
+        genes={
+            "1": [
+                "1\t100\t.\tA\tG\t.\tPASS\tCLNSIG=Benign;AF=0.001;CSQ=missense_variant",
+            ],
+        },
+        failed_genes={"2": "No orthologs found"},
+    )
+
+    result = compact_run_in_place(run_dir)
+
+    assert result.successful_genes == 1
+    assert result.failed_genes == 1
+    assert result.deleted_gene_dirs == 2
+    assert not (run_dir / "gene_1").exists()
+    assert not (run_dir / "gene_2").exists()
+    assert (run_dir / "genes.csv.gz").exists()
+    assert (run_dir / "variants.csv.gz").exists()
+    assert (run_dir / "failure_events.csv.gz").exists()
+    assert (run_dir / "analysis_summary.json.gz").exists()
+
+    manifest = json.loads((run_dir / "run_manifest.json").read_text())
+    assert manifest["compaction"]["raw_gene_dirs_deleted"] is True
+    assert manifest["counts"]["successful_genes"] == 1
+    assert manifest["counts"]["failed_genes"] == 1
+
+    data = load_exported_run_data(run_dir, run_label="run_alpha")
+    assert len(data["gene_rows"]) == 2
+    assert len(data["variant_rows"]) == 1
+
+
+def test_compact_run_in_place_refuses_to_delete_incomplete_runs(tmp_path):
+    run_dir = tmp_path / "run_alpha"
+    _make_compaction_run(
+        run_dir,
+        params={"run_id": "alpha", "gene_ids": [1, 2]},
+        genes={"1": ["1\t100\t.\tA\tG\t.\tPASS\tAF=0.001"]},
+    )
+    incomplete_dir = run_dir / "gene_2"
+    incomplete_dir.mkdir(parents=True)
+    (incomplete_dir / "partial.tmp").write_text("in progress")
+
+    with pytest.raises(ValueError, match="Refusing to delete raw outputs"):
+        compact_run_in_place(run_dir)
+
+    assert (run_dir / "gene_1" / "gene_snps_annotated.vcf").exists()
+    assert (run_dir / "gene_2" / "partial.tmp").exists()
+    assert not (run_dir / "run_manifest.json").exists()
 
 
 def test_build_resume_plan_starts_from_first_incomplete(tmp_path):
@@ -146,3 +233,48 @@ def test_read_run_params_gene_ids(tmp_path):
     _touch(run_dir / "run_params.json", '{"gene_ids": "not-a-list"}')
     with pytest.raises(TypeError):
         pipeline_main._read_run_params_gene_ids(run_dir)
+
+
+def _make_compaction_run(
+    run_dir: Path,
+    params: dict,
+    genes: dict[str, list[str]] | None = None,
+    failed_genes: dict[str, str] | None = None,
+) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "run_params.json").write_text(json.dumps(params))
+    (run_dir / "ortholog_resolution.csv").write_text(
+        "timestamp,gene_id,requested_scope,effective_scope,source_used,from_cache,species_count,sequence_count\n"
+        "2026-01-01T00:00:00,1,all,all,ncbi_all,true,10,10\n"
+    )
+
+    genes = genes or {}
+    for gene_id, variant_lines in genes.items():
+        gene_dir = run_dir / f"gene_{gene_id}"
+        gene_dir.mkdir(parents=True, exist_ok=True)
+        header = [
+            "##fileformat=VCFv4.3",
+            "#CHROM\tPOS\tID\tREF\tALT\tQUAL\tFILTER\tINFO",
+        ]
+        payload = "\n".join(header + variant_lines) + "\n"
+        (gene_dir / "gene_snps_annotated.vcf").write_text(payload)
+
+    failed_genes = failed_genes or {}
+    if failed_genes:
+        with (run_dir / "failed_genes.jsonl").open("w") as handle:
+            for gene_id, message in failed_genes.items():
+                gene_dir = run_dir / f"gene_{gene_id}"
+                gene_dir.mkdir(parents=True, exist_ok=True)
+                failure_payload = {
+                    "gene_id": int(gene_id),
+                    "gene_dir": str(gene_dir),
+                    "status": "failed",
+                    "started_at": "2026-01-01T00:00:00",
+                    "finished_at": "2026-01-01T00:00:10",
+                    "duration_seconds": 10.0,
+                    "error_type": "RuntimeError",
+                    "error_message": message,
+                    "error_traceback": "Traceback",
+                }
+                handle.write(json.dumps(failure_payload) + "\n")
+                (gene_dir / "failure.json").write_text(json.dumps(failure_payload))

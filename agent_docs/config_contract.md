@@ -12,6 +12,7 @@ Validation happens in `pipeline/pipeline.py` before processing genes:
 - resume run path: `pipeline/pipeline.py:197`, `pipeline/pipeline.py:296`
 - BAM filtering block: `pipeline/pipeline.py:86`
 - cache block: `pipeline/pipeline.py:135`
+- output compaction block: `pipeline/pipeline.py`
 
 If you add a config field, update validation here first.
 
@@ -32,10 +33,24 @@ Critical details:
 - Gene terminal states in resume mode (`pipeline/pipeline.py:229`):
   - success: `gene_snps_annotated.vcf` exists and non-empty
   - failed: `failure.json` exists and non-empty
+  - compacted success/failed: status row in `genes.csv.gz` when raw gene files were deleted
 - Resume start point is first non-terminal gene in config order (`pipeline/pipeline.py:243`).
 - If all genes are terminal, pipeline starts a new run directory (`pipeline/pipeline.py:316`).
+- A compacted run with incomplete/missing genes is not resumable.
 - New run directories keep the `run_` prefix and use `run_name` or the config stem as the base name.
 - If the base name already exists, a numeric suffix is appended: `__2`, `__3`, ...
+
+## Output Compaction Rules
+
+- Optional config block: `output_compaction`.
+- `output_compaction.enabled` defaults to `false`.
+- When enabled, compaction runs after all genes finish and writes compact run-level files:
+  - `run_manifest.json`
+  - `genes.csv.gz`
+  - `variants.csv.gz`
+  - `failure_events.csv.gz`
+  - `analysis_summary.json.gz`
+- Raw `gene_<ID>/` directories are deleted only after compact files are validated.
 
 ## BAM Filtering Rules
 
