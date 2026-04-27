@@ -11,7 +11,11 @@ __pycache__/
 .DS_Store
 .ipynb_checkpoints/
 analysis/*
-!analysis/*.py
+!analysis/compare_runs_on_csv.py
+!analysis/comparison_read_geometry_analysis.py
+!analysis/export_run_analysis_data.py
+!analysis/run_data_workflow.py
+!analysis/run_snapshot.py
 !analysis/data_runs/
 analysis/data_runs/*
 !analysis/data_runs/README.md
