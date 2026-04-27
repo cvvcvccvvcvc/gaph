@@ -12,8 +12,6 @@ __pycache__/
 .ipynb_checkpoints/
 analysis/*
 !analysis/*.py
-!analysis/compare_runs_on_csv.ipynb
-!analysis/export_and_compare_runs.ipynb
 !analysis/data_runs/
 analysis/data_runs/*
 !analysis/data_runs/README.md
