@@ -56,6 +56,7 @@ loguru_stub.logger = _LoggerStub()
 sys.modules.setdefault("loguru", loguru_stub)
 
 import pipeline as pipeline_main  # noqa: E402
+import run_compaction  # noqa: E402
 from run_compaction import compact_run_in_place, load_exported_run_data  # noqa: E402
 
 
@@ -129,6 +130,9 @@ def test_compact_run_in_place_writes_snapshot_and_deletes_gene_dirs(tmp_path):
         },
         failed_genes={"2": "No orthologs found"},
     )
+    stale_temp_dir = run_dir / ".compaction_stale"
+    stale_temp_dir.mkdir()
+    (stale_temp_dir / "partial.tmp").write_text("left by interrupted compaction")
 
     result = compact_run_in_place(run_dir)
 
@@ -137,6 +141,7 @@ def test_compact_run_in_place_writes_snapshot_and_deletes_gene_dirs(tmp_path):
     assert result.deleted_gene_dirs == 2
     assert not (run_dir / "gene_1").exists()
     assert not (run_dir / "gene_2").exists()
+    assert not stale_temp_dir.exists()
     assert (run_dir / "genes.csv.gz").exists()
     assert (run_dir / "variants.csv.gz").exists()
     assert (run_dir / "failure_events.csv.gz").exists()
@@ -147,9 +152,51 @@ def test_compact_run_in_place_writes_snapshot_and_deletes_gene_dirs(tmp_path):
     assert manifest["counts"]["successful_genes"] == 1
     assert manifest["counts"]["failed_genes"] == 1
 
+    with gzip.open(run_dir / "analysis_summary.json.gz", "rt") as handle:
+        summary = json.load(handle)
+    assert summary["clnsig_counts"] == [{"CLNSIG": "Benign", "count": 1}]
+    assert summary["af_stats"]["count"] == 1
+    assert summary["run_impact_rows"] == [
+        {
+            "source": "gnomAD_CSQ",
+            "impact_class": "MODERATE",
+            "count": 1,
+            "source_total": 1,
+            "share_%": 100.0,
+        }
+    ]
+
     data = load_exported_run_data(run_dir, run_label="run_alpha")
     assert len(data["gene_rows"]) == 2
     assert len(data["variant_rows"]) == 1
+
+
+def test_compact_run_in_place_does_not_load_variants_during_validation(tmp_path, monkeypatch):
+    run_dir = tmp_path / "run_alpha"
+    _make_compaction_run(
+        run_dir,
+        params={"run_id": "alpha", "gene_ids": [1]},
+        genes={
+            "1": [
+                "1\t100\t.\tA\tG\t.\tPASS\tAF=0.001;CSQ=missense_variant",
+                "1\t101\t.\tC\tT\t.\tPASS\tAF=0.2;CSQ=synonymous_variant",
+            ],
+        },
+    )
+
+    original_read_gzip_csv = run_compaction._read_gzip_csv
+
+    def guarded_read_gzip_csv(path: Path):
+        if Path(path).name == "variants.csv.gz":
+            raise AssertionError("variants.csv.gz should be counted as a stream during validation")
+        return original_read_gzip_csv(path)
+
+    monkeypatch.setattr(run_compaction, "_read_gzip_csv", guarded_read_gzip_csv)
+
+    result = run_compaction.compact_run_in_place(run_dir)
+
+    assert result.total_variants == 2
+    assert not (run_dir / "gene_1").exists()
 
 
 def test_compact_run_in_place_refuses_to_delete_incomplete_runs(tmp_path):

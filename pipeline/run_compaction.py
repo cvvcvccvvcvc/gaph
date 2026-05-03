@@ -10,7 +10,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 
 EXPORT_SCHEMA_VERSION = 1
@@ -151,33 +151,9 @@ def export_run(run_dir: Path, export_dir: Path, relative_run_path: str | None = 
         failure_events.append(terminal_failures[gene_id])
 
     gene_rows: list[dict[str, Any]] = []
-    variant_rows: list[dict[str, Any]] = []
     seen_gene_ids: set[str] = set()
-
-    for gene_dir in sorted(run_dir.glob("gene_*")):
-        if not gene_dir.is_dir():
-            continue
-
-        gene_id = gene_dir.name.replace("gene_", "", 1)
-        seen_gene_ids.add(gene_id)
-        annotated_vcf = gene_dir / "gene_snps_annotated.vcf"
-
-        if _is_nonempty_file(annotated_vcf):
-            gene_variant_rows = parse_annotated_vcf(annotated_vcf, run_label, gene_id)
-            variant_rows.extend(gene_variant_rows)
-            gene_rows.append(_build_gene_row(run_label, gene_id, "success", gene_variant_rows))
-            continue
-
-        failure_record = terminal_failures.get(gene_id, {})
-        status = "failed" if failure_record else "incomplete"
-        gene_rows.append(_build_gene_row(run_label, gene_id, status, [], failure_record))
-
-    for gene_id in sorted(set(requested_gene_ids) | set(terminal_failures.keys())):
-        if gene_id in seen_gene_ids:
-            continue
-        failure_record = terminal_failures.get(gene_id, {})
-        status = "failed" if failure_record else "missing"
-        gene_rows.append(_build_gene_row(run_label, gene_id, status, [], failure_record))
+    summary_builder = AnalysisSummaryBuilder()
+    variant_row_count = 0
 
     ortholog_resolution_path = run_dir / "ortholog_resolution.csv"
     exported_ortholog_resolution_path = export_dir / "ortholog_resolution.csv"
@@ -187,10 +163,43 @@ def export_run(run_dir: Path, export_dir: Path, relative_run_path: str | None = 
         exported_ortholog_resolution_path.unlink(missing_ok=True)
 
     _write_json(export_dir / "run_params.json", params)
+
+    with gzip.open(export_dir / "variants.csv.gz", "wt", newline="") as handle:
+        variant_writer = csv.DictWriter(handle, fieldnames=VARIANT_FIELDS)
+        variant_writer.writeheader()
+
+        for gene_dir in sorted(run_dir.glob("gene_*")):
+            if not gene_dir.is_dir():
+                continue
+
+            gene_id = gene_dir.name.replace("gene_", "", 1)
+            seen_gene_ids.add(gene_id)
+            annotated_vcf = gene_dir / "gene_snps_annotated.vcf"
+
+            if _is_nonempty_file(annotated_vcf):
+                gene_stats = _new_gene_variant_stats()
+                for row in iter_annotated_vcf_rows(annotated_vcf, run_label, gene_id):
+                    variant_writer.writerow({key: row.get(key, "") for key in VARIANT_FIELDS})
+                    summary_builder.add(row)
+                    _update_gene_variant_stats(gene_stats, row)
+                    variant_row_count += 1
+                gene_rows.append(_build_gene_row_from_stats(run_label, gene_id, "success", gene_stats))
+                continue
+
+            failure_record = terminal_failures.get(gene_id, {})
+            status = "failed" if failure_record else "incomplete"
+            gene_rows.append(_build_gene_row(run_label, gene_id, status, [], failure_record))
+
+    for gene_id in sorted(set(requested_gene_ids) | set(terminal_failures.keys())):
+        if gene_id in seen_gene_ids:
+            continue
+        failure_record = terminal_failures.get(gene_id, {})
+        status = "failed" if failure_record else "missing"
+        gene_rows.append(_build_gene_row(run_label, gene_id, status, [], failure_record))
+
     _write_gzip_csv(export_dir / "genes.csv.gz", GENE_FIELDS, gene_rows)
-    _write_gzip_csv(export_dir / "variants.csv.gz", VARIANT_FIELDS, variant_rows)
     _write_gzip_csv(export_dir / "failure_events.csv.gz", FAILURE_EVENT_FIELDS, failure_events)
-    _write_gzip_json(export_dir / "analysis_summary.json.gz", build_analysis_summary_from_variant_rows(variant_rows))
+    _write_gzip_json(export_dir / "analysis_summary.json.gz", summary_builder.build())
 
     gene_counts = {
         "successful_genes": sum(1 for row in gene_rows if row["status"] == "success"),
@@ -208,7 +217,7 @@ def export_run(run_dir: Path, export_dir: Path, relative_run_path: str | None = 
         "counts": {
             "requested_genes": len(requested_gene_ids),
             "gene_rows": len(gene_rows),
-            "variant_rows": len(variant_rows),
+            "variant_rows": variant_row_count,
             "failure_events": len(failure_events),
             **gene_counts,
         },
@@ -231,7 +240,7 @@ def export_run(run_dir: Path, export_dir: Path, relative_run_path: str | None = 
         failed_genes=gene_counts["failed_genes"],
         incomplete_genes=gene_counts["incomplete_genes"],
         missing_genes=gene_counts["missing_genes"],
-        total_variants=len(variant_rows),
+        total_variants=variant_row_count,
     )
 
 
@@ -277,6 +286,7 @@ def compact_run_in_place(run_dir: Path) -> RunCompactionResult:
         validation=published,
     )
     validate_compacted_run(run_dir, allow_incomplete=False)
+    _delete_compaction_temp_dirs(run_dir)
 
     return RunCompactionResult(
         run_dir=run_dir,
@@ -305,13 +315,13 @@ def validate_compacted_run(export_dir: Path, *, allow_incomplete: bool = False) 
         raise ValueError(f"Invalid compact manifest counts: {manifest_path}")
 
     genes_rows = _read_gzip_csv(export_dir / "genes.csv.gz")
-    variant_rows = _read_gzip_csv(export_dir / "variants.csv.gz")
+    variant_row_count = _count_gzip_csv_rows(export_dir / "variants.csv.gz")
     failure_rows = _read_gzip_csv(export_dir / "failure_events.csv.gz")
     _read_gzip_json(export_dir / "analysis_summary.json.gz")
 
     expected_counts = {
         "gene_rows": len(genes_rows),
-        "variant_rows": len(variant_rows),
+        "variant_rows": variant_row_count,
         "failure_events": len(failure_rows),
         "successful_genes": sum(1 for row in genes_rows if row.get("status") == "success"),
         "failed_genes": sum(1 for row in genes_rows if row.get("status") == "failed"),
@@ -380,6 +390,16 @@ def _delete_raw_gene_dirs(run_dir: Path) -> int:
     return deleted
 
 
+def _delete_compaction_temp_dirs(run_dir: Path) -> int:
+    deleted = 0
+    for path in sorted(run_dir.glob(".compaction_*")):
+        if not path.is_dir():
+            continue
+        shutil.rmtree(path)
+        deleted += 1
+    return deleted
+
+
 def _mark_compaction(
     run_dir: Path,
     *,
@@ -401,9 +421,11 @@ def _mark_compaction(
     _write_json(manifest_path, manifest)
 
 
-def parse_annotated_vcf(vcf_path: Path, run_label: str, gene_id: str) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
-
+def iter_annotated_vcf_rows(
+    vcf_path: Path,
+    run_label: str,
+    gene_id: str,
+) -> Iterator[dict[str, Any]]:
     with Path(vcf_path).open() as handle:
         for line in handle:
             if line.startswith("#"):
@@ -428,32 +450,32 @@ def parse_annotated_vcf(vcf_path: Path, run_label: str, gene_id: str) -> list[di
             has_clinvar_record = bool(clnsig or clnrevstat or clnsigconf)
             has_gnomad = af is not None
 
-            rows.append(
-                {
-                    "run_id": run_label,
-                    "gene_id": str(gene_id),
-                    "chrom": chrom,
-                    "pos": int(pos),
-                    "ref": ref,
-                    "alt": alt,
-                    "variant_key": f"{chrom}:{pos}:{ref}>{alt}",
-                    "filter": filter_value,
-                    "clnsig": clnsig,
-                    "clnrevstat": clnrevstat,
-                    "clnsigconf": clnsigconf,
-                    "af": af if af is not None else "",
-                    "af_raw": af_raw,
-                    "mc": mc,
-                    "csq": csq,
-                    "hgvsc": hgvsc,
-                    "has_clnsig": int(has_clnsig),
-                    "has_clinvar_record": int(has_clinvar_record),
-                    "has_gnomad": int(has_gnomad),
-                    "has_both": int(has_clnsig and has_gnomad),
-                }
-            )
+            yield {
+                "run_id": run_label,
+                "gene_id": str(gene_id),
+                "chrom": chrom,
+                "pos": int(pos),
+                "ref": ref,
+                "alt": alt,
+                "variant_key": f"{chrom}:{pos}:{ref}>{alt}",
+                "filter": filter_value,
+                "clnsig": clnsig,
+                "clnrevstat": clnrevstat,
+                "clnsigconf": clnsigconf,
+                "af": af if af is not None else "",
+                "af_raw": af_raw,
+                "mc": mc,
+                "csq": csq,
+                "hgvsc": hgvsc,
+                "has_clnsig": int(has_clnsig),
+                "has_clinvar_record": int(has_clinvar_record),
+                "has_gnomad": int(has_gnomad),
+                "has_both": int(has_clnsig and has_gnomad),
+            }
 
-    return rows
+
+def parse_annotated_vcf(vcf_path: Path, run_label: str, gene_id: str) -> list[dict[str, Any]]:
+    return list(iter_annotated_vcf_rows(vcf_path, run_label, gene_id))
 
 
 def load_exported_run_data(
@@ -571,28 +593,43 @@ def load_exported_analysis_summary(export_dir: Path) -> dict[str, Any] | None:
     if not variants_path.exists():
         return None
 
-    variant_rows = _read_gzip_csv(variants_path)
-    summary = build_analysis_summary_from_variant_rows(variant_rows)
+    summary_builder = AnalysisSummaryBuilder()
+    for row in _iter_gzip_csv(variants_path):
+        summary_builder.add(row)
+    summary = summary_builder.build()
     _write_gzip_json(summary_path, summary)
     return summary
 
 
 def build_analysis_summary_from_variant_rows(variant_rows: list[dict[str, Any]]) -> dict[str, Any]:
-    clnsig_counts: dict[str, int] = {}
-    grouped_clnsig_counts: dict[str, int] = {}
-    benign_star_counts: dict[str, int] = {}
-    conflicting_submitter_counts: dict[str, int] = {}
-    conflicting_gene_counts: dict[str, dict[str, int]] = {}
-    mc_term_counts: dict[str, int] = {}
-    csq_term_counts: dict[str, int] = {}
-    impact_rows: list[dict[str, Any]] = []
-    af_values: list[float] = []
-    both_annotated_count = 0
-    discordant_count = 0
-    gene_both_counts: dict[str, int] = {}
-    gene_discordant_counts: dict[str, int] = {}
-
+    summary_builder = AnalysisSummaryBuilder()
     for row in variant_rows:
+        summary_builder.add(row)
+    return summary_builder.build()
+
+
+class AnalysisSummaryBuilder:
+    """Incrementally build run-level analysis without retaining every variant row."""
+
+    def __init__(self) -> None:
+        self.clnsig_counts: dict[str, int] = {}
+        self.grouped_clnsig_counts: dict[str, int] = {}
+        self.benign_star_counts: dict[str, int] = {}
+        self.conflicting_submitter_counts: dict[str, int] = {}
+        self.conflicting_gene_counts: dict[str, dict[str, int]] = {}
+        self.mc_term_counts: dict[str, int] = {}
+        self.csq_term_counts: dict[str, int] = {}
+        self.af_values: list[float] = []
+        self.both_annotated_count = 0
+        self.discordant_count = 0
+        self.gene_both_counts: dict[str, int] = {}
+        self.gene_discordant_counts: dict[str, int] = {}
+        self.impact_run_counts: dict[tuple[str, str], int] = {}
+        self.impact_run_source_totals: dict[str, int] = {}
+        self.impact_gene_counts: dict[tuple[str, str, str], int] = {}
+        self.impact_gene_source_totals: dict[tuple[str, str], int] = {}
+
+    def add(self, row: dict[str, Any]) -> None:
         gene_id = str(row.get("gene_id", ""))
         clnsig = str(row.get("clnsig", "")).strip()
         clnrevstat = str(row.get("clnrevstat", "")).strip()
@@ -600,26 +637,26 @@ def build_analysis_summary_from_variant_rows(variant_rows: list[dict[str, Any]])
 
         if clnsig:
             for label in split_clnsig_labels(clnsig):
-                clnsig_counts[label] = clnsig_counts.get(label, 0) + 1
+                self.clnsig_counts[label] = self.clnsig_counts.get(label, 0) + 1
             grouped = group_clnsig(clnsig)
-            grouped_clnsig_counts[grouped] = grouped_clnsig_counts.get(grouped, 0) + 1
+            self.grouped_clnsig_counts[grouped] = self.grouped_clnsig_counts.get(grouped, 0) + 1
 
             labels = split_clnsig_labels(clnsig)
             if any(is_benign_label(label) for label in labels):
                 stars = clinvar_stars_from_review_status(clnrevstat)
                 bucket = f"benign_{stars}" if stars is not None else "benign_unknown"
-                benign_star_counts[bucket] = benign_star_counts.get(bucket, 0) + 1
+                self.benign_star_counts[bucket] = self.benign_star_counts.get(bucket, 0) + 1
 
             if "Conflicting_classifications_of_pathogenicity" in labels:
                 parsed = parse_clnsigconf_submitter_counts(clnsigconf)
-                gene_bucket = conflicting_gene_counts.setdefault(gene_id, {})
+                gene_bucket = self.conflicting_gene_counts.setdefault(gene_id, {})
                 for label, count in parsed.items():
-                    conflicting_submitter_counts[label] = conflicting_submitter_counts.get(label, 0) + count
+                    self.conflicting_submitter_counts[label] = self.conflicting_submitter_counts.get(label, 0) + count
                     gene_bucket[label] = gene_bucket.get(label, 0) + count
 
         af_raw = str(row.get("af", "")).strip()
         if af_raw:
-            af_values.append(float(af_raw))
+            self.af_values.append(float(af_raw))
 
         mc_terms = parse_mc_terms(str(row.get("mc", "")))
         csq_terms = parse_csq_terms(str(row.get("csq", "")))
@@ -627,70 +664,128 @@ def build_analysis_summary_from_variant_rows(variant_rows: list[dict[str, Any]])
         csq_class = classify_terms(csq_terms)
 
         for term in mc_terms:
-            mc_term_counts[term] = mc_term_counts.get(term, 0) + 1
+            self.mc_term_counts[term] = self.mc_term_counts.get(term, 0) + 1
         for term in csq_terms:
-            csq_term_counts[term] = csq_term_counts.get(term, 0) + 1
+            self.csq_term_counts[term] = self.csq_term_counts.get(term, 0) + 1
 
         if mc_class is not None:
-            impact_rows.append({"gene_id": gene_id, "source": "ClinVar_MC", "impact_class": mc_class})
+            self._add_impact(gene_id, "ClinVar_MC", mc_class)
         if csq_class is not None:
-            impact_rows.append({"gene_id": gene_id, "source": "gnomAD_CSQ", "impact_class": csq_class})
+            self._add_impact(gene_id, "gnomAD_CSQ", csq_class)
 
         if mc_class is not None and csq_class is not None:
-            both_annotated_count += 1
-            gene_both_counts[gene_id] = gene_both_counts.get(gene_id, 0) + 1
+            self.both_annotated_count += 1
+            self.gene_both_counts[gene_id] = self.gene_both_counts.get(gene_id, 0) + 1
             if mc_class != csq_class:
-                discordant_count += 1
-                gene_discordant_counts[gene_id] = gene_discordant_counts.get(gene_id, 0) + 1
+                self.discordant_count += 1
+                self.gene_discordant_counts[gene_id] = self.gene_discordant_counts.get(gene_id, 0) + 1
 
-    run_impact_rows, run_gene_impact_rows = _summarize_impact_rows(impact_rows)
-    run_mismatch_summary = (
-        {
-            "discordant_count": discordant_count,
-            "both_annotated_count": both_annotated_count,
-            "discordant_share_%": round(discordant_count / both_annotated_count * 100, 2) if both_annotated_count else 0.0,
+    def _add_impact(self, gene_id: str, source: str, impact_class: str) -> None:
+        self.impact_run_counts[(source, impact_class)] = (
+            self.impact_run_counts.get((source, impact_class), 0) + 1
+        )
+        self.impact_run_source_totals[source] = self.impact_run_source_totals.get(source, 0) + 1
+        self.impact_gene_counts[(gene_id, source, impact_class)] = (
+            self.impact_gene_counts.get((gene_id, source, impact_class), 0) + 1
+        )
+        self.impact_gene_source_totals[(gene_id, source)] = (
+            self.impact_gene_source_totals.get((gene_id, source), 0) + 1
+        )
+
+    def build(self) -> dict[str, Any]:
+        run_impact_rows, run_gene_impact_rows = self._summarize_impact_counts()
+        run_mismatch_summary = (
+            {
+                "discordant_count": self.discordant_count,
+                "both_annotated_count": self.both_annotated_count,
+                "discordant_share_%": round(
+                    self.discordant_count / self.both_annotated_count * 100,
+                    2,
+                )
+                if self.both_annotated_count
+                else 0.0,
+            }
+            if self.both_annotated_count
+            else None
+        )
+        run_gene_mismatch_rows = [
+            {
+                "gene_id": gene_id,
+                "discordant_count": self.gene_discordant_counts.get(gene_id, 0),
+                "both_annotated_count": self.gene_both_counts.get(gene_id, 0),
+                "discordant_share_%": round(
+                    self.gene_discordant_counts.get(gene_id, 0)
+                    / self.gene_both_counts.get(gene_id, 0)
+                    * 100,
+                    2,
+                )
+                if self.gene_both_counts.get(gene_id, 0)
+                else 0.0,
+            }
+            for gene_id in sorted(self.gene_discordant_counts.keys(), key=_gene_sort_key)
+        ]
+
+        conflicting_gene_rows = []
+        all_conf_labels = sorted(self.conflicting_submitter_counts.keys(), key=str.lower)
+        for gene_id in sorted(self.conflicting_gene_counts.keys(), key=_gene_sort_key):
+            row = {"gene_id": gene_id}
+            per_gene = self.conflicting_gene_counts[gene_id]
+            for label in all_conf_labels:
+                row[label] = int(per_gene.get(label, 0))
+            row["total_submitters"] = int(sum(per_gene.values()))
+            conflicting_gene_rows.append(row)
+
+        return {
+            "schema_version": EXPORT_SCHEMA_VERSION,
+            "clnsig_counts": _counts_to_rows("CLNSIG", self.clnsig_counts),
+            "grouped_clnsig_counts": _counts_to_rows("Group", self.grouped_clnsig_counts),
+            "benign_star_counts": _counts_to_rows("benign_star_bucket", self.benign_star_counts),
+            "conflicting_clnsigconf_counts": _counts_to_rows(
+                "CLNSIGCONF",
+                self.conflicting_submitter_counts,
+            ),
+            "conflicting_clnsigconf_by_gene": conflicting_gene_rows,
+            "af_stats": build_af_summary(self.af_values),
+            "run_impact_rows": run_impact_rows,
+            "run_gene_impact_rows": run_gene_impact_rows,
+            "run_mismatch_summary": run_mismatch_summary,
+            "run_gene_mismatch_rows": run_gene_mismatch_rows,
+            "mc_terms": _counts_to_rows("MC_term", self.mc_term_counts),
+            "csq_terms": _counts_to_rows("CSQ_term", self.csq_term_counts),
         }
-        if both_annotated_count
-        else None
-    )
-    run_gene_mismatch_rows = [
-        {
-            "gene_id": gene_id,
-            "discordant_count": gene_discordant_counts.get(gene_id, 0),
-            "both_annotated_count": gene_both_counts.get(gene_id, 0),
-            "discordant_share_%": round(
-                gene_discordant_counts.get(gene_id, 0) / gene_both_counts.get(gene_id, 0) * 100,
-                2,
-            ) if gene_both_counts.get(gene_id, 0) else 0.0,
-        }
-        for gene_id in sorted(gene_discordant_counts.keys(), key=_gene_sort_key)
-    ]
 
-    conflicting_gene_rows = []
-    all_conf_labels = sorted(conflicting_submitter_counts.keys(), key=str.lower)
-    for gene_id in sorted(conflicting_gene_counts.keys(), key=_gene_sort_key):
-        row = {"gene_id": gene_id}
-        per_gene = conflicting_gene_counts[gene_id]
-        for label in all_conf_labels:
-            row[label] = int(per_gene.get(label, 0))
-        row["total_submitters"] = int(sum(per_gene.values()))
-        conflicting_gene_rows.append(row)
+    def _summarize_impact_counts(self) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        run_rows = []
+        for (source, impact_class), count in sorted(self.impact_run_counts.items()):
+            source_total = self.impact_run_source_totals[source]
+            run_rows.append(
+                {
+                    "source": source,
+                    "impact_class": impact_class,
+                    "count": count,
+                    "source_total": source_total,
+                    "share_%": round(count / source_total * 100, 2) if source_total else 0.0,
+                }
+            )
 
-    return {
-        "schema_version": EXPORT_SCHEMA_VERSION,
-        "clnsig_counts": _counts_to_rows("CLNSIG", clnsig_counts),
-        "grouped_clnsig_counts": _counts_to_rows("Group", grouped_clnsig_counts),
-        "benign_star_counts": _counts_to_rows("benign_star_bucket", benign_star_counts),
-        "conflicting_clnsigconf_counts": _counts_to_rows("CLNSIGCONF", conflicting_submitter_counts),
-        "conflicting_clnsigconf_by_gene": conflicting_gene_rows,
-        "af_stats": build_af_summary(af_values),
-        "run_impact_rows": run_impact_rows,
-        "run_gene_impact_rows": run_gene_impact_rows,
-        "run_mismatch_summary": run_mismatch_summary,
-        "run_gene_mismatch_rows": run_gene_mismatch_rows,
-        "mc_terms": _counts_to_rows("MC_term", mc_term_counts),
-        "csq_terms": _counts_to_rows("CSQ_term", csq_term_counts),
-    }
+        gene_rows = []
+        for (gene_id, source, impact_class), count in sorted(
+            self.impact_gene_counts.items(),
+            key=lambda item: (item[0][1], _gene_sort_key(item[0][0]), item[0][2]),
+        ):
+            source_total = self.impact_gene_source_totals[(gene_id, source)]
+            gene_rows.append(
+                {
+                    "gene_id": gene_id,
+                    "source": source,
+                    "impact_class": impact_class,
+                    "count": count,
+                    "source_total": source_total,
+                    "share_%": round(count / source_total * 100, 2) if source_total else 0.0,
+                }
+            )
+
+        return run_rows, gene_rows
 
 
 def _build_terminal_failures(run_dir: Path, failure_events: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -777,18 +872,53 @@ def _build_gene_row(
     variant_rows: list[dict[str, Any]],
     failure_record: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    stats = _new_gene_variant_stats()
+    for row in variant_rows:
+        _update_gene_variant_stats(stats, row)
+    return _build_gene_row_from_stats(run_label, gene_id, status, stats, failure_record)
+
+
+def _new_gene_variant_stats() -> dict[str, int]:
+    return {
+        "total_variants": 0,
+        "clinvar_intersected": 0,
+        "clinvar_record_count": 0,
+        "gnomad_intersected": 0,
+        "clinvar_gnomad_both": 0,
+        "mc_annotated_variants": 0,
+        "csq_annotated_variants": 0,
+    }
+
+
+def _update_gene_variant_stats(stats: dict[str, int], row: dict[str, Any]) -> None:
+    stats["total_variants"] += 1
+    stats["clinvar_intersected"] += _as_int(row.get("has_clnsig", 0))
+    stats["clinvar_record_count"] += _as_int(row.get("has_clinvar_record", 0))
+    stats["gnomad_intersected"] += _as_int(row.get("has_gnomad", 0))
+    stats["clinvar_gnomad_both"] += _as_int(row.get("has_both", 0))
+    stats["mc_annotated_variants"] += int(bool(row.get("mc")))
+    stats["csq_annotated_variants"] += int(bool(row.get("csq")))
+
+
+def _build_gene_row_from_stats(
+    run_label: str,
+    gene_id: str,
+    status: str,
+    stats: dict[str, int],
+    failure_record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     failure_record = failure_record or {}
     return {
         "run_id": run_label,
         "gene_id": str(gene_id),
         "status": status,
-        "total_variants": len(variant_rows),
-        "clinvar_intersected": sum(_as_int(row.get("has_clnsig", 0)) for row in variant_rows),
-        "clinvar_record_count": sum(_as_int(row.get("has_clinvar_record", 0)) for row in variant_rows),
-        "gnomad_intersected": sum(_as_int(row.get("has_gnomad", 0)) for row in variant_rows),
-        "clinvar_gnomad_both": sum(_as_int(row.get("has_both", 0)) for row in variant_rows),
-        "mc_annotated_variants": sum(1 for row in variant_rows if row.get("mc")),
-        "csq_annotated_variants": sum(1 for row in variant_rows if row.get("csq")),
+        "total_variants": stats["total_variants"],
+        "clinvar_intersected": stats["clinvar_intersected"],
+        "clinvar_record_count": stats["clinvar_record_count"],
+        "gnomad_intersected": stats["gnomad_intersected"],
+        "clinvar_gnomad_both": stats["clinvar_gnomad_both"],
+        "mc_annotated_variants": stats["mc_annotated_variants"],
+        "csq_annotated_variants": stats["csq_annotated_variants"],
         "error_type": failure_record.get("error_type", ""),
         "error_message": failure_record.get("error_message", ""),
     }
@@ -1103,6 +1233,25 @@ def _read_gzip_csv(path: Path) -> list[dict[str, str]]:
         return []
     with gzip.open(path, "rt", newline="") as handle:
         return list(csv.DictReader(handle))
+
+
+def _iter_gzip_csv(path: Path) -> Iterator[dict[str, str]]:
+    if not path.exists():
+        return
+    with gzip.open(path, "rt", newline="") as handle:
+        yield from csv.DictReader(handle)
+
+
+def _count_gzip_csv_rows(path: Path) -> int:
+    if not path.exists():
+        return 0
+    with gzip.open(path, "rt", newline="") as handle:
+        reader = csv.reader(handle)
+        try:
+            next(reader)
+        except StopIteration:
+            return 0
+        return sum(1 for _row in reader)
 
 
 def _load_run_params(run_dir: Path) -> dict[str, Any]:
