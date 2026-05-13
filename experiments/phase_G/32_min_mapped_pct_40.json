@@ -631,8 +631,8 @@
     "wrong_strand": true,
     "lis": true,
     "overlap": false,
-    "min_mapped_pct_of_generated": 0,
-    "max_pct_filtered": 80,
+    "min_mapped_pct_of_generated": 40,
+    "max_pct_filtered": 100,
     "min_kept_pct_of_reference": 0
   }
 }
