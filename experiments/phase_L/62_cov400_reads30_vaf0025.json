@@ -600,8 +600,8 @@
   },
   "variant_calling": {
     "min_var_freq": 0.025,
-    "min_coverage": 2000,
-    "min_reads2": 2
+    "min_coverage": 400,
+    "min_reads2": 30
   },
   "ortholog_selection": {
     "scope": "mammals"
@@ -635,6 +635,6 @@
     "max_pct_filtered": 100,
     "min_kept_pct_of_reference": 0
   },
-  "run_name": "53_cov2000_reads2_vaf0025",
+  "run_name": "62_cov400_reads30_vaf0025",
   "resume_run_dir": null
 }

@@ -600,7 +600,7 @@
   },
   "variant_calling": {
     "min_var_freq": 0.025,
-    "min_coverage": 2250,
+    "min_coverage": 400,
     "min_reads2": 2
   },
   "ortholog_selection": {
@@ -635,6 +635,6 @@
     "max_pct_filtered": 100,
     "min_kept_pct_of_reference": 0
   },
-  "run_name": "54_cov2250_reads2_vaf0025",
+  "run_name": "59_cov400_reads2_vaf0025",
   "resume_run_dir": null
 }
